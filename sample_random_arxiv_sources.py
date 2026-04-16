@@ -33,8 +33,10 @@ from statement_reference_audit_wholebody import (
 ARXIV_SUBMISSION_DATE_QUERY = "submittedDate:[202602010000 TO 202603312359]"
 ARXIV_CATEGORY_QUERY = "cat:math.*"
 ARXIV_SEARCH_QUERY = f"{ARXIV_SUBMISSION_DATE_QUERY} AND {ARXIV_CATEGORY_QUERY}"
-ARXIV_SEARCH_PAGE_SIZE = 1_000
-ARXIV_SEARCH_PROGRESS_INTERVAL = 500
+ARXIV_SEARCH_PAGE_SIZE = 100
+ARXIV_SEARCH_DELAY_SECONDS = 10.0
+ARXIV_SEARCH_PROGRESS_INTERVAL = 100
+ARXIV_CANDIDATE_POOL_CACHE_NAME = "math_candidate_pool_2026-02_2026-03.json"
 
 
 @dataclass
@@ -95,7 +97,123 @@ def canonicalize_sampled_arxiv_id(value: str) -> str:
     return ARXIV_VERSION_SUFFIX_RE.sub("", normalize_arxiv_id(value))
 
 
-def fetch_math_candidate_ids() -> list[str]:
+def candidate_pool_cache_path(downloads_root: Path) -> Path:
+    return downloads_root / ARXIV_CANDIDATE_POOL_CACHE_NAME
+
+
+def load_cached_math_candidate_ids(downloads_root: Path) -> list[str] | None:
+    cache_path = candidate_pool_cache_path(downloads_root)
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if payload.get("search_query") != ARXIV_SEARCH_QUERY:
+        return None
+
+    cached_ids = payload.get("candidate_ids")
+    if not isinstance(cached_ids, list) or not cached_ids:
+        return None
+
+    normalized_ids = [
+        canonicalize_sampled_arxiv_id(value)
+        for value in cached_ids
+        if isinstance(value, str) and value.strip()
+    ]
+    if not normalized_ids:
+        return None
+
+    print(f"Using cached math candidate pool from {cache_path} ({len(normalized_ids)} papers).")
+    return normalized_ids
+
+
+def write_cached_math_candidate_ids(downloads_root: Path, candidate_ids: list[str]) -> None:
+    cache_path = candidate_pool_cache_path(downloads_root)
+    payload = {
+        "search_query": ARXIV_SEARCH_QUERY,
+        "candidate_ids": candidate_ids,
+    }
+    cache_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def iter_math_search_results(
+    search,
+    rate_limit_retries: int,
+    rate_limit_base_delay: float,
+):
+    try:
+        import arxiv
+    except ImportError as exc:
+        raise RuntimeError(
+            "The `arxiv` package is not installed. Install it first with `pip install arxiv`."
+        ) from exc
+
+    client = arxiv.Client(
+        page_size=ARXIV_SEARCH_PAGE_SIZE,
+        delay_seconds=ARXIV_SEARCH_DELAY_SECONDS,
+        num_retries=0,
+    )
+    start = 0
+    total_results: int | None = None
+    first_page = True
+
+    while True:
+        page_url = client._format_url(search, start, client.page_size)
+        feed = None
+        for attempt in range(rate_limit_retries + 1):
+            try:
+                feed = client._parse_feed(page_url, first_page=first_page)
+                break
+            except Exception as exc:
+                if attempt >= rate_limit_retries or not exception_is_rate_limited(exc):
+                    raise
+                delay = rate_limit_base_delay * (2 ** attempt)
+                print(
+                    "  rate limited while building the math candidate pool "
+                    f"(offset {start}); retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+
+        if feed is None:
+            raise RuntimeError("Failed to fetch the math candidate pool page.")
+        if not feed.entries:
+            if first_page:
+                raise RuntimeError("The math-only arXiv candidate pool is empty.")
+            break
+
+        if total_results is None:
+            total_results = int(feed.feed.opensearch_totalresults)
+            print(f"  arXiv reports {total_results} matching math submissions")
+
+        for entry in feed.entries:
+            try:
+                yield arxiv.Result._from_feed_entry(entry)
+            except arxiv.Result.MissingFieldError:
+                continue
+
+        if not feed.entries:
+            break
+        start += len(feed.entries)
+        first_page = False
+        if total_results is not None and start >= total_results:
+            break
+
+
+def fetch_math_candidate_ids(
+    downloads_root: Path,
+    rate_limit_retries: int,
+    rate_limit_base_delay: float,
+) -> list[str]:
+    cached_ids = load_cached_math_candidate_ids(downloads_root)
+    if cached_ids is not None:
+        return cached_ids
+
     try:
         import arxiv
     except ImportError as exc:
@@ -104,11 +222,6 @@ def fetch_math_candidate_ids() -> list[str]:
         ) from exc
 
     print(f"Building arXiv candidate pool from query: {ARXIV_SEARCH_QUERY}")
-    client = arxiv.Client(
-        page_size=ARXIV_SEARCH_PAGE_SIZE,
-        delay_seconds=3.0,
-        num_retries=3,
-    )
     search = arxiv.Search(
         query=ARXIV_SEARCH_QUERY,
         max_results=None,
@@ -119,7 +232,11 @@ def fetch_math_candidate_ids() -> list[str]:
     candidate_ids: list[str] = []
     seen_ids: set[str] = set()
     try:
-        for result in client.results(search):
+        for result in iter_math_search_results(
+            search=search,
+            rate_limit_retries=rate_limit_retries,
+            rate_limit_base_delay=rate_limit_base_delay,
+        ):
             arxiv_id = canonicalize_sampled_arxiv_id(result.get_short_id())
             if arxiv_id in seen_ids:
                 continue
@@ -133,6 +250,7 @@ def fetch_math_candidate_ids() -> list[str]:
     if not candidate_ids:
         raise RuntimeError("The math-only arXiv candidate pool is empty.")
 
+    write_cached_math_candidate_ids(downloads_root, candidate_ids)
     print(f"Loaded {len(candidate_ids)} math-category candidates.")
     return candidate_ids
 
@@ -552,7 +670,11 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     try:
-        candidate_ids = fetch_math_candidate_ids()
+        candidate_ids = fetch_math_candidate_ids(
+            downloads_root=downloads_root,
+            rate_limit_retries=args.rate_limit_retries,
+            rate_limit_base_delay=args.rate_limit_base_delay,
+        )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
