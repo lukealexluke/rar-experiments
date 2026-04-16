@@ -49,6 +49,14 @@ class MaskedAuditRecord:
     mask_end: int
 
 
+@dataclass
+class CandidatePoolCache:
+    candidate_ids: list[str]
+    next_start: int
+    total_results: int | None
+    complete: bool
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -101,7 +109,7 @@ def candidate_pool_cache_path(downloads_root: Path) -> Path:
     return downloads_root / ARXIV_CANDIDATE_POOL_CACHE_NAME
 
 
-def load_cached_math_candidate_ids(downloads_root: Path) -> list[str] | None:
+def load_candidate_pool_cache(downloads_root: Path) -> CandidatePoolCache | None:
     cache_path = candidate_pool_cache_path(downloads_root)
     if not cache_path.exists():
         return None
@@ -123,86 +131,71 @@ def load_cached_math_candidate_ids(downloads_root: Path) -> list[str] | None:
         for value in cached_ids
         if isinstance(value, str) and value.strip()
     ]
-    if not normalized_ids:
+    next_start = payload.get("next_start")
+    total_results = payload.get("total_results")
+    complete = payload.get("complete")
+
+    # Backward compatibility with the old completed-cache format.
+    if next_start is None and complete is None:
+        if not normalized_ids:
+            return None
+        return CandidatePoolCache(
+            candidate_ids=normalized_ids,
+            next_start=len(normalized_ids),
+            total_results=None,
+            complete=True,
+        )
+
+    if not isinstance(next_start, int) or next_start < 0:
+        return None
+    if total_results is not None and (not isinstance(total_results, int) or total_results < 0):
+        return None
+    if not isinstance(complete, bool):
         return None
 
-    print(f"Using cached math candidate pool from {cache_path} ({len(normalized_ids)} papers).")
-    return normalized_ids
+    return CandidatePoolCache(
+        candidate_ids=normalized_ids,
+        next_start=next_start,
+        total_results=total_results,
+        complete=complete,
+    )
 
 
-def write_cached_math_candidate_ids(downloads_root: Path, candidate_ids: list[str]) -> None:
+def write_candidate_pool_cache(downloads_root: Path, cache: CandidatePoolCache) -> None:
     cache_path = candidate_pool_cache_path(downloads_root)
     payload = {
         "search_query": ARXIV_SEARCH_QUERY,
-        "candidate_ids": candidate_ids,
+        "candidate_ids": cache.candidate_ids,
+        "next_start": cache.next_start,
+        "total_results": cache.total_results,
+        "complete": cache.complete,
     }
-    cache_path.write_text(
+    temp_cache_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    temp_cache_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    temp_cache_path.replace(cache_path)
 
 
-def iter_math_search_results(
-    search,
-    rate_limit_retries: int,
-    rate_limit_base_delay: float,
-):
-    try:
-        import arxiv
-    except ImportError as exc:
-        raise RuntimeError(
-            "The `arxiv` package is not installed. Install it first with `pip install arxiv`."
-        ) from exc
+def exception_is_retryable_arxiv_pool_error(exc: BaseException) -> bool:
+    if exception_is_rate_limited(exc):
+        return True
 
-    client = arxiv.Client(
-        page_size=ARXIV_SEARCH_PAGE_SIZE,
-        delay_seconds=ARXIV_SEARCH_DELAY_SECONDS,
-        num_retries=0,
-    )
-    start = 0
-    total_results: int | None = None
-    first_page = True
-
-    while True:
-        page_url = client._format_url(search, start, client.page_size)
-        feed = None
-        for attempt in range(rate_limit_retries + 1):
-            try:
-                feed = client._parse_feed(page_url, first_page=first_page)
-                break
-            except Exception as exc:
-                if attempt >= rate_limit_retries or not exception_is_rate_limited(exc):
-                    raise
-                delay = rate_limit_base_delay * (2 ** attempt)
-                print(
-                    "  rate limited while building the math candidate pool "
-                    f"(offset {start}); retrying in {delay:.1f}s"
-                )
-                time.sleep(delay)
-
-        if feed is None:
-            raise RuntimeError("Failed to fetch the math candidate pool page.")
-        if not feed.entries:
-            if first_page:
-                raise RuntimeError("The math-only arXiv candidate pool is empty.")
-            break
-
-        if total_results is None:
-            total_results = int(feed.feed.opensearch_totalresults)
-            print(f"  arXiv reports {total_results} matching math submissions")
-
-        for entry in feed.entries:
-            try:
-                yield arxiv.Result._from_feed_entry(entry)
-            except arxiv.Result.MissingFieldError:
-                continue
-
-        if not feed.entries:
-            break
-        start += len(feed.entries)
-        first_page = False
-        if total_results is not None and start >= total_results:
-            break
+    transient_status_codes = {500, 502, 503, 504}
+    for item in iter_exception_chain(exc):
+        if item.__class__.__name__ in {"ConnectionError", "UnexpectedEmptyPageError"}:
+            return True
+        status = getattr(item, "status", None)
+        if status in transient_status_codes:
+            return True
+        code = getattr(item, "code", None)
+        if code in transient_status_codes:
+            return True
+        message = str(item)
+        if any(f"HTTP {status_code}" in message for status_code in transient_status_codes):
+            return True
+    return False
 
 
 def fetch_math_candidate_ids(
@@ -210,9 +203,14 @@ def fetch_math_candidate_ids(
     rate_limit_retries: int,
     rate_limit_base_delay: float,
 ) -> list[str]:
-    cached_ids = load_cached_math_candidate_ids(downloads_root)
-    if cached_ids is not None:
-        return cached_ids
+    cache_path = candidate_pool_cache_path(downloads_root)
+    cached_pool = load_candidate_pool_cache(downloads_root)
+    if cached_pool is not None and cached_pool.complete:
+        print(
+            f"Using cached math candidate pool from {cache_path} "
+            f"({len(cached_pool.candidate_ids)} papers)."
+        )
+        return cached_pool.candidate_ids
 
     try:
         import arxiv
@@ -229,28 +227,92 @@ def fetch_math_candidate_ids(
         sort_order=arxiv.SortOrder.Ascending,
     )
 
-    candidate_ids: list[str] = []
-    seen_ids: set[str] = set()
+    client = arxiv.Client(
+        page_size=ARXIV_SEARCH_PAGE_SIZE,
+        delay_seconds=ARXIV_SEARCH_DELAY_SECONDS,
+        num_retries=0,
+    )
+    candidate_ids = list(cached_pool.candidate_ids) if cached_pool is not None else []
+    seen_ids = set(candidate_ids)
+    start = cached_pool.next_start if cached_pool is not None else 0
+    total_results = cached_pool.total_results if cached_pool is not None else None
+
+    if cached_pool is not None and not cached_pool.complete:
+        print(
+            f"Resuming cached math candidate pool from {cache_path} at offset {start} "
+            f"with {len(candidate_ids)} papers saved so far."
+        )
+
     try:
-        for result in iter_math_search_results(
-            search=search,
-            rate_limit_retries=rate_limit_retries,
-            rate_limit_base_delay=rate_limit_base_delay,
-        ):
-            arxiv_id = canonicalize_sampled_arxiv_id(result.get_short_id())
-            if arxiv_id in seen_ids:
-                continue
-            seen_ids.add(arxiv_id)
-            candidate_ids.append(arxiv_id)
+        while True:
+            page_url = client._format_url(search, start, client.page_size)
+            feed = None
+            for attempt in range(rate_limit_retries + 1):
+                try:
+                    feed = client._parse_feed(page_url, first_page=(start == 0))
+                    break
+                except Exception as exc:
+                    if attempt >= rate_limit_retries or not exception_is_retryable_arxiv_pool_error(exc):
+                        raise
+                    delay = rate_limit_base_delay * (2 ** attempt)
+                    print(
+                        "  transient arXiv error while building the math candidate pool "
+                        f"(offset {start}); retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+
+            if feed is None:
+                raise RuntimeError("Failed to fetch the math candidate pool page.")
+            if not feed.entries:
+                if start == 0:
+                    raise RuntimeError("The math-only arXiv candidate pool is empty.")
+                break
+
+            if total_results is None:
+                total_results = int(feed.feed.opensearch_totalresults)
+                print(f"  arXiv reports {total_results} matching math submissions")
+
+            for entry in feed.entries:
+                try:
+                    result = arxiv.Result._from_feed_entry(entry)
+                except arxiv.Result.MissingFieldError:
+                    continue
+                arxiv_id = canonicalize_sampled_arxiv_id(result.get_short_id())
+                if arxiv_id in seen_ids:
+                    continue
+                seen_ids.add(arxiv_id)
+                candidate_ids.append(arxiv_id)
+
+            start += len(feed.entries)
+            write_candidate_pool_cache(
+                downloads_root,
+                CandidatePoolCache(
+                    candidate_ids=list(candidate_ids),
+                    next_start=start,
+                    total_results=total_results,
+                    complete=False,
+                ),
+            )
             if len(candidate_ids) % ARXIV_SEARCH_PROGRESS_INTERVAL == 0:
                 print(f"  loaded {len(candidate_ids)} candidate papers so far")
+
+            if total_results is not None and start >= total_results:
+                break
     except Exception as exc:
         raise RuntimeError(f"Could not build the math-only arXiv candidate pool: {exc}") from exc
 
     if not candidate_ids:
         raise RuntimeError("The math-only arXiv candidate pool is empty.")
 
-    write_cached_math_candidate_ids(downloads_root, candidate_ids)
+    write_candidate_pool_cache(
+        downloads_root,
+        CandidatePoolCache(
+            candidate_ids=list(candidate_ids),
+            next_start=start,
+            total_results=total_results,
+            complete=True,
+        ),
+    )
     print(f"Loaded {len(candidate_ids)} math-category candidates.")
     return candidate_ids
 
