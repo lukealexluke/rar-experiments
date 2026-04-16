@@ -13,6 +13,7 @@ from pathlib import Path
 
 from statement_reference_audit_wholebody import (
     ARXIV_ID_CUTOFF,
+    ARXIV_VERSION_SUFFIX_RE,
     DEFAULT_CITE_COMMANDS,
     STATEMENT_LOCATOR_RE,
     bib_entry_uses_allowed_arxiv_ids,
@@ -29,10 +30,11 @@ from statement_reference_audit_wholebody import (
     strip_tex_comments,
 )
 
-TOTAL_RANDOM_DRAWS = 54_335
-ARXIV_ID_MODULUS = 24_290
-FIRST_PREFIX = "2602"
-SECOND_PREFIX = "2603"
+ARXIV_SUBMISSION_DATE_QUERY = "submittedDate:[202602010000 TO 202603312359]"
+ARXIV_CATEGORY_QUERY = "cat:math.*"
+ARXIV_SEARCH_QUERY = f"{ARXIV_SUBMISSION_DATE_QUERY} AND {ARXIV_CATEGORY_QUERY}"
+ARXIV_SEARCH_PAGE_SIZE = 1_000
+ARXIV_SEARCH_PROGRESS_INTERVAL = 500
 
 
 @dataclass
@@ -48,9 +50,9 @@ class MaskedAuditRecord:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Randomly download arXiv TeX sources, keep only the main TeX file and "
-            "bibliography, and retain only papers whose whole-body citation audit "
-            "produces at least one logged line."
+            "Randomly download February-March 2026 arXiv math-category TeX sources, "
+            "keep only the main TeX file and bibliography, and retain only papers "
+            "whose whole-body citation audit produces at least one logged line."
         )
     )
     parser.add_argument(
@@ -89,15 +91,65 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def sample_arxiv_id(rng: random.Random) -> tuple[int, str]:
-    draw = rng.randint(1, TOTAL_RANDOM_DRAWS)
-    # Follow the requested split literally and map a zero remainder back to 24290,
-    # since arXiv identifiers are 1-based rather than 0-based.
-    prefix = FIRST_PREFIX if draw < ARXIV_ID_MODULUS else SECOND_PREFIX
-    suffix = draw % ARXIV_ID_MODULUS
-    if suffix == 0:
-        suffix = ARXIV_ID_MODULUS
-    return draw, f"{prefix}.{suffix:05d}"
+def canonicalize_sampled_arxiv_id(value: str) -> str:
+    return ARXIV_VERSION_SUFFIX_RE.sub("", normalize_arxiv_id(value))
+
+
+def fetch_math_candidate_ids() -> list[str]:
+    try:
+        import arxiv
+    except ImportError as exc:
+        raise RuntimeError(
+            "The `arxiv` package is not installed. Install it first with `pip install arxiv`."
+        ) from exc
+
+    print(f"Building arXiv candidate pool from query: {ARXIV_SEARCH_QUERY}")
+    client = arxiv.Client(
+        page_size=ARXIV_SEARCH_PAGE_SIZE,
+        delay_seconds=3.0,
+        num_retries=3,
+    )
+    search = arxiv.Search(
+        query=ARXIV_SEARCH_QUERY,
+        max_results=None,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Ascending,
+    )
+
+    candidate_ids: list[str] = []
+    seen_ids: set[str] = set()
+    try:
+        for result in client.results(search):
+            arxiv_id = canonicalize_sampled_arxiv_id(result.get_short_id())
+            if arxiv_id in seen_ids:
+                continue
+            seen_ids.add(arxiv_id)
+            candidate_ids.append(arxiv_id)
+            if len(candidate_ids) % ARXIV_SEARCH_PROGRESS_INTERVAL == 0:
+                print(f"  loaded {len(candidate_ids)} candidate papers so far")
+    except Exception as exc:
+        raise RuntimeError(f"Could not build the math-only arXiv candidate pool: {exc}") from exc
+
+    if not candidate_ids:
+        raise RuntimeError("The math-only arXiv candidate pool is empty.")
+
+    print(f"Loaded {len(candidate_ids)} math-category candidates.")
+    return candidate_ids
+
+
+def load_existing_kept_ids(downloads_root: Path) -> set[str]:
+    kept_ids: set[str] = set()
+    for metadata_path in sorted(downloads_root.glob("paper_*/paper_metadata.json")):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for key in ("paper_source", "resolved_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                kept_ids.add(canonicalize_sampled_arxiv_id(value))
+                break
+    return kept_ids
 
 
 def path_is_within_directory(path: Path, directory: Path) -> bool:
@@ -424,6 +476,8 @@ def write_paper_metadata(
         "bibliography_files": sorted(path.name for path in paper_dir.glob("bib_*.txt")),
         "log_file": output_path.name,
         "logged_line_count": logged_line_count,
+        "sample_query": ARXIV_SEARCH_QUERY,
+        "sampled_without_replacement": True,
     }
     (paper_dir / "paper_metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
@@ -476,19 +530,6 @@ def audit_downloaded_source(
         raise
 
 
-def next_unique_sample(rng: random.Random, attempted_ids: set[str]) -> tuple[int, str]:
-    unique_space_size = (2 * ARXIV_ID_MODULUS) - 1
-    if len(attempted_ids) >= unique_space_size:
-        raise RuntimeError("Exhausted the configured random arXiv ID sample space.")
-
-    while True:
-        draw, arxiv_id = sample_arxiv_id(rng)
-        if arxiv_id in attempted_ids:
-            continue
-        attempted_ids.add(arxiv_id)
-        return draw, arxiv_id
-
-
 def main() -> int:
     args = parse_args()
     if args.count <= 0:
@@ -510,24 +551,58 @@ def main() -> int:
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(args.seed)
-    attempted_ids: set[str] = set()
+    try:
+        candidate_ids = fetch_math_candidate_ids()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    existing_kept_ids = load_existing_kept_ids(downloads_root)
+    if existing_kept_ids:
+        original_candidate_count = len(candidate_ids)
+        candidate_ids = [arxiv_id for arxiv_id in candidate_ids if arxiv_id not in existing_kept_ids]
+        skipped_count = original_candidate_count - len(candidate_ids)
+        print(
+            f"Excluded {skipped_count} already-kept papers found in {downloads_root} "
+            "from the candidate pool."
+        )
+
+    if not candidate_ids:
+        print("Error: no math-category candidates remain after exclusions.", file=sys.stderr)
+        return 1
+
+    rng.shuffle(candidate_ids)
+    print(
+        f"Sampling without replacement from {len(candidate_ids)} February-March 2026 "
+        "math-category arXiv papers."
+    )
+
+    max_unique_attempts = len(candidate_ids)
+    if args.max_attempts is not None:
+        max_unique_attempts = min(args.max_attempts, len(candidate_ids))
+        if args.max_attempts > len(candidate_ids):
+            print(
+                f"Requested max-attempts={args.max_attempts}, but only {len(candidate_ids)} "
+                "unique math-category candidates are available."
+            )
+
     successes = 0
     attempts = 0
 
     while successes < args.count:
-        if args.max_attempts is not None and attempts >= args.max_attempts:
+        if attempts >= max_unique_attempts:
             print(
-                f"Reached max-attempts={args.max_attempts} after keeping {successes} papers.",
+                f"Stopped after {attempts} unique attempts and kept {successes} papers.",
                 file=sys.stderr,
             )
             return 1
 
-        draw, sampled_id = next_unique_sample(rng, attempted_ids)
+        sampled_id = candidate_ids.pop()
         attempts += 1
         source_dir: Path | None = None
         resolved_id = sampled_id
 
-        print(f"[attempt {attempts}] draw {draw} -> {sampled_id}")
+        print(f"[attempt {attempts}] sampled {sampled_id}")
         try:
             source_dir, resolved_id, downloaded = ensure_arxiv_source_tree_with_backoff(
                 sampled_id,
