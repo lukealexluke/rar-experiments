@@ -25,7 +25,7 @@ from statement_reference_audit import (
 DEFAULT_API_KEY_ENV = "openai_key"
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING_EFFORT = "medium"
-DEFAULT_MAX_OUTPUT_TOKENS = 4000
+DEFAULT_MAX_OUTPUT_TOKENS = 12000
 DEFAULT_MCP_LABEL = "theoremsearch"
 DEFAULT_MCP_URL = "https://api.theoremsearch.com/mcp"
 DEFAULT_ALLOWED_MCP_TOOLS = ("theorem_search",)
