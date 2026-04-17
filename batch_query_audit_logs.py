@@ -32,6 +32,10 @@ from query_openai_tex_mcp import (
 )
 
 CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+DEFAULT_LOGS_DIR = Path("statement_reference_audit_logs")
+FALLBACK_LOGS_DIRS = (
+    Path("random_arxiv_source_samples") / "statement_reference_audit_logs",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,8 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logs-dir",
         type=Path,
-        default=Path("statement_reference_audit_logs"),
-        help="Directory containing statement audit logs. Defaults to statement_reference_audit_logs.",
+        default=DEFAULT_LOGS_DIR,
+        help=(
+            "Directory containing statement audit logs. Defaults to "
+            "statement_reference_audit_logs and falls back to "
+            "random_arxiv_source_samples/statement_reference_audit_logs when present."
+        ),
     )
     parser.add_argument(
         "--search-root",
@@ -133,6 +141,20 @@ def parse_args() -> argparse.Namespace:
 
 def sorted_log_paths(logs_dir: Path) -> list[Path]:
     return sorted(logs_dir.glob("*.log"), key=lambda path: path.name)
+
+
+def resolve_logs_dir(requested_logs_dir: Path) -> Path:
+    candidates = [requested_logs_dir]
+    if requested_logs_dir == DEFAULT_LOGS_DIR:
+        candidates.extend(FALLBACK_LOGS_DIRS)
+
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.exists() and resolved.is_dir():
+            return resolved
+
+    rendered = ", ".join(str(candidate.resolve()) for candidate in candidates)
+    raise RuntimeError(f"logs directory does not exist. Tried: {rendered}")
 
 
 def resolve_current_tex_path(logged_tex_path: Path, search_root: Path) -> Path:
@@ -232,9 +254,10 @@ def normalize_optional_string(value: object) -> str:
 
 def main() -> int:
     args = parse_args()
-    logs_dir = args.logs_dir.resolve()
-    if not logs_dir.exists() or not logs_dir.is_dir():
-        print(f"Error: logs directory does not exist: {logs_dir}", file=sys.stderr)
+    try:
+        logs_dir = resolve_logs_dir(args.logs_dir)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
     if args.max_items is not None and args.max_items <= 0:
         print("Error: max-items must be positive when provided.", file=sys.stderr)
