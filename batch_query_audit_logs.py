@@ -70,6 +70,14 @@ def parse_args() -> argparse.Namespace:
         help="Output JSONL log path. Defaults to <logs-dir>/openai_query_results.jsonl.",
     )
     parser.add_argument(
+        "--raw-response-dir",
+        type=Path,
+        help=(
+            "Optional directory where raw OpenAI response JSON files are written for "
+            "items that do not complete cleanly."
+        ),
+    )
+    parser.add_argument(
         "--prompt",
         help=(
             "Optional custom task instruction appended after the audit-log context. "
@@ -253,6 +261,14 @@ def normalize_optional_string(value: object) -> str:
     return cleaned
 
 
+def make_raw_response_path(
+    raw_response_dir: Path,
+    log_path: Path,
+    record_index: int,
+) -> Path:
+    return raw_response_dir / f"{log_path.stem}_item_{record_index}.json"
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -272,6 +288,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    raw_response_dir = (
+        (args.raw_response_dir or (output_log.parent / "raw_openai_responses")).resolve()
+    )
 
     try:
         dotenv_path = load_environment_from_dotenv()
@@ -298,6 +317,7 @@ def main() -> int:
         return 1
 
     output_log.parent.mkdir(parents=True, exist_ok=True)
+    raw_response_dir.mkdir(parents=True, exist_ok=True)
     processed_items = 0
     with output_log.open("w", encoding="utf-8") as handle:
         for log_path in log_paths:
@@ -343,6 +363,7 @@ def main() -> int:
                     "response_status": None,
                     "incomplete_details": None,
                     "usage_details": None,
+                    "raw_response_file": None,
                     "error": None,
                 }
 
@@ -402,6 +423,17 @@ def main() -> int:
                             "usage_details": usage_details or None,
                         }
                     )
+                    if response_status != "completed":
+                        raw_response_path = make_raw_response_path(
+                            raw_response_dir=raw_response_dir,
+                            log_path=log_path,
+                            record_index=record.record_index,
+                        )
+                        raw_response_path.write_text(
+                            json.dumps(response_data, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        result["raw_response_file"] = str(raw_response_path)
                     if response_status and response_status != "completed":
                         print(
                             f"Warning: {log_path.name} item {record.record_index} returned "
@@ -410,6 +442,8 @@ def main() -> int:
                         )
                 except Exception as exc:
                     result["error"] = str(exc)
+                    if result["raw_response_file"] is None:
+                        result["raw_response_file"] = None
                     print(
                         f"Warning: GPT query failed for {log_path.name} item {record.record_index}: {exc}",
                         file=sys.stderr,
