@@ -6,9 +6,20 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 import os
+import re
+import shutil
 import sys
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+from statement_reference_audit import (
+    DEFAULT_CITE_COMMANDS,
+    find_macro_occurrences,
+    iter_bbl_entries,
+    iter_bib_entries,
+    read_candidate_text,
+)
 
 
 DEFAULT_API_KEY_ENV = "openai_key"
@@ -26,6 +37,11 @@ DEFAULT_LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
 DEFAULT_OPENAI_INPUT_COST_ENV = "OPENAI_INPUT_COST_PER_1M"
 DEFAULT_OPENAI_CACHED_INPUT_COST_ENV = "OPENAI_CACHED_INPUT_COST_PER_1M"
 DEFAULT_OPENAI_OUTPUT_COST_ENV = "OPENAI_OUTPUT_COST_PER_1M"
+AUDIT_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+")
+WHOLEBODY_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+Line:\s+(\d+)$")
+STATEMENT_LOG_LINE_RE = re.compile(r"^Line:\s+(\d+)$")
+ARXIV_CITATION_KEY_RE = re.compile(r"([^,\[\]]+?)\s*\[[^\]]+\]")
+LOG_SEPARATOR_LINE = "-" * 80
 
 
 @dataclass(frozen=True)
@@ -66,15 +82,64 @@ class LangfuseRuntime:
     status_message: str | None = None
 
 
+@dataclass(frozen=True)
+class AuditLogRecord:
+    record_index: int
+    line_number: int
+    bib_keys: tuple[str, ...]
+    line_text: str = ""
+    original_statement: str = ""
+
+
+@dataclass(frozen=True)
+class AuditLogContext:
+    log_path: Path
+    tex_path: Path
+    bibliography_paths: tuple[Path, ...]
+    records: tuple[AuditLogRecord, ...]
+
+
+@dataclass(frozen=True)
+class PreparedUploadInputs:
+    tex_path: Path
+    bib_path: Path
+    status_messages: tuple[str, ...]
+    prompt_note: str | None = None
+    audit_log_path: Path | None = None
+    audit_record_index: int | None = None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Upload a .tex file and a .txt bib file to the OpenAI Responses API, "
+            "Upload a .tex file and a bibliography source to the OpenAI Responses API, "
             "and let the model use the TheoremSearch MCP server."
         )
     )
     parser.add_argument("tex_file", type=Path, help="Path to the LaTeX source file.")
-    parser.add_argument("bib_file", type=Path, help="Path to the BibTeX file.")
+    parser.add_argument(
+        "bib_file",
+        type=Path,
+        help="Path to the bibliography source (.txt, .bib, or .bbl).",
+    )
+    parser.add_argument(
+        "--audit-log",
+        type=Path,
+        help=(
+            "Optional statement audit log path. When provided, the uploaded TeX is "
+            "truncated at the selected logged line, the logged citation is masked as "
+            "[Citation Needed], and the logged bibliography entry is removed from the "
+            "uploaded bibliography text."
+        ),
+    )
+    parser.add_argument(
+        "--log-entry",
+        type=int,
+        help=(
+            "1-based audit-log entry index to sanitize against. Required when the "
+            "selected audit log contains multiple entries."
+        ),
+    )
     parser.add_argument(
         "--prompt",
         help=(
@@ -208,13 +273,443 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def prepare_upload_inputs(
+    tex_path: Path,
+    bib_path: Path,
+    audit_log_path: Path | None,
+    log_entry_index: int | None,
+    temp_dir: Path,
+) -> PreparedUploadInputs:
+    status_messages: list[str] = []
+    prompt_note: str | None = None
+    effective_log_path = audit_log_path or find_associated_audit_log(tex_path)
+    selected_record: AuditLogRecord | None = None
+    bibliography_sources: list[Path] = [bib_path]
+
+    upload_tex_path = tex_path
+    if effective_log_path is not None:
+        audit_context = parse_audit_log(effective_log_path)
+        if not audit_log_matches_tex(audit_context.tex_path, tex_path):
+            raise RuntimeError(
+                f"Audit log {effective_log_path} points to {audit_context.tex_path}, not {tex_path}."
+            )
+        selected_record = select_audit_log_record(audit_context, log_entry_index)
+        if audit_context.bibliography_paths:
+            bibliography_sources = resolve_logged_bibliography_paths(
+                logged_paths=audit_context.bibliography_paths,
+                tex_path=tex_path,
+                fallback_bib_path=bib_path,
+            )
+        upload_tex_path = write_sanitized_tex_upload(
+            tex_path=tex_path,
+            record=selected_record,
+            temp_dir=temp_dir,
+        )
+        status_messages.append(
+            f"Using audit log {effective_log_path.name} entry {selected_record.record_index} "
+            f"at line {selected_record.line_number}; uploading truncated masked TeX."
+        )
+        if selected_record.bib_keys:
+            status_messages.append(
+                "Removing logged bibliography key(s) from upload: "
+                + ", ".join(selected_record.bib_keys)
+            )
+        prompt_note = (
+            f"The uploaded LaTeX source has been truncated to end at line {selected_record.line_number} "
+            "from the associated audit log. The logged citation on that line has been replaced with "
+            "[Citation Needed]. The matching bibliography entry has been removed from the uploaded "
+            "bibliography text when it could be identified."
+        )
+    elif bib_path.suffix.lower() != ".txt":
+        status_messages.append(
+            f"Converting {bib_path.name} to a temporary .txt bibliography upload for OpenAI."
+        )
+
+    upload_bib_path = build_bibliography_upload_file(
+        paper_source=tex_path.stem,
+        bib_paths=bibliography_sources,
+        temp_dir=temp_dir,
+        excluded_keys=selected_record.bib_keys if selected_record is not None else (),
+    )
+    return PreparedUploadInputs(
+        tex_path=upload_tex_path,
+        bib_path=upload_bib_path,
+        status_messages=tuple(status_messages),
+        prompt_note=prompt_note,
+        audit_log_path=effective_log_path,
+        audit_record_index=selected_record.record_index if selected_record is not None else None,
+    )
+
+
+def find_associated_audit_log(tex_path: Path) -> Path | None:
+    candidate_dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+    search_roots = [tex_path.parent, *tex_path.parents, Path.cwd()]
+    for root in search_roots:
+        candidate_dir = root / "statement_reference_audit_logs"
+        if candidate_dir in seen_dirs:
+            continue
+        seen_dirs.add(candidate_dir)
+        if candidate_dir.exists() and candidate_dir.is_dir():
+            candidate_dirs.append(candidate_dir)
+
+    matches: list[Path] = []
+    for candidate_dir in candidate_dirs:
+        for log_path in sorted(candidate_dir.glob("*.log")):
+            try:
+                for line in read_candidate_text(log_path).splitlines():
+                    if not line.startswith("Input: "):
+                        continue
+                    logged_tex_path = Path(line[len("Input: ") :].strip()).resolve()
+                    if audit_log_matches_tex(logged_tex_path, tex_path):
+                        matches.append(log_path.resolve())
+                        break
+            except OSError:
+                continue
+
+    if not matches:
+        return None
+    if len(matches) > 1:
+        rendered = ", ".join(str(path) for path in matches)
+        raise RuntimeError(
+            f"Multiple associated audit logs matched {tex_path}. Pass --audit-log explicitly. Matches: {rendered}"
+        )
+    return matches[0]
+
+
+def parse_audit_log(log_path: Path) -> AuditLogContext:
+    lines = read_candidate_text(log_path).splitlines()
+    input_line = next((line for line in lines if line.startswith("Input: ")), None)
+    bibliography_line = next((line for line in lines if line.startswith("Bibliography files: ")), None)
+    if input_line is None:
+        raise RuntimeError(f"Missing Input header in {log_path}")
+    if bibliography_line is None:
+        raise RuntimeError(f"Missing Bibliography files header in {log_path}")
+
+    tex_path = Path(input_line[len("Input: ") :].strip()).resolve()
+    bibliography_value = bibliography_line[len("Bibliography files: ") :].strip()
+    bibliography_paths: list[Path] = []
+    if bibliography_value != "(none found)":
+        bibliography_paths = [
+            Path(part.strip()).resolve()
+            for part in bibliography_value.split(", ")
+            if part.strip()
+        ]
+
+    if lines and lines[0].startswith("Whole-body citation audit"):
+        records = parse_wholebody_audit_log_records(lines)
+    else:
+        records = parse_statement_audit_log_records(lines)
+    return AuditLogContext(
+        log_path=log_path.resolve(),
+        tex_path=tex_path,
+        bibliography_paths=tuple(bibliography_paths),
+        records=tuple(records),
+    )
+
+
+def audit_log_matches_tex(logged_tex_path: Path, tex_path: Path) -> bool:
+    if logged_tex_path == tex_path:
+        return True
+    return (
+        logged_tex_path.name == tex_path.name
+        and logged_tex_path.parent.name == tex_path.parent.name
+    )
+
+
+def resolve_logged_bibliography_paths(
+    logged_paths: Sequence[Path],
+    tex_path: Path,
+    fallback_bib_path: Path,
+) -> list[Path]:
+    resolved_paths: list[Path] = []
+    for logged_path in logged_paths:
+        if logged_path.exists():
+            resolved_paths.append(logged_path)
+            continue
+        same_name_in_tex_dir = (tex_path.parent / logged_path.name).resolve()
+        if same_name_in_tex_dir.exists():
+            resolved_paths.append(same_name_in_tex_dir)
+            continue
+        if fallback_bib_path.name == logged_path.name and fallback_bib_path.exists():
+            resolved_paths.append(fallback_bib_path)
+
+    if not resolved_paths:
+        resolved_paths.append(fallback_bib_path)
+    return [Path(path).resolve() for path in dedupe_preserving_order([str(path) for path in resolved_paths])]
+
+
+def parse_statement_audit_log_records(lines: Sequence[str]) -> list[AuditLogRecord]:
+    records: list[AuditLogRecord] = []
+    index = 0
+    while index < len(lines):
+        header_match = AUDIT_LOG_ENTRY_RE.match(lines[index].strip())
+        if not header_match:
+            index += 1
+            continue
+
+        record_index = int(header_match.group(1))
+        index += 1
+        line_number: int | None = None
+        bib_keys: list[str] = []
+        original_statement_lines: list[str] = []
+
+        while index < len(lines) and lines[index].strip() != LOG_SEPARATOR_LINE:
+            line = lines[index]
+            line_match = STATEMENT_LOG_LINE_RE.match(line.strip())
+            if line_match:
+                line_number = int(line_match.group(1))
+                index += 1
+                continue
+            if line == "ArXiv citations:":
+                index += 1
+                while index < len(lines) and lines[index].startswith("  - "):
+                    bib_keys.extend(extract_bib_keys_from_log_line(lines[index]))
+                    index += 1
+                continue
+            if line == "Original statement:":
+                index += 1
+                while index < len(lines) and lines[index].strip() != LOG_SEPARATOR_LINE:
+                    original_statement_lines.append(lines[index])
+                    index += 1
+                continue
+            index += 1
+
+        if line_number is None:
+            raise RuntimeError(f"Missing line number in audit log entry [{record_index}]")
+
+        records.append(
+            AuditLogRecord(
+                record_index=record_index,
+                line_number=line_number,
+                bib_keys=tuple(dedupe_preserving_order(bib_keys)),
+                original_statement="\n".join(original_statement_lines).strip(),
+            )
+        )
+        index += 1
+    return records
+
+
+def parse_wholebody_audit_log_records(lines: Sequence[str]) -> list[AuditLogRecord]:
+    records: list[AuditLogRecord] = []
+    index = 0
+    while index < len(lines):
+        match = WHOLEBODY_LOG_ENTRY_RE.match(lines[index].strip())
+        if not match:
+            index += 1
+            continue
+
+        record_index = int(match.group(1))
+        line_number = int(match.group(2))
+        line_text = lines[index + 1].rstrip() if index + 1 < len(lines) else ""
+        bib_keys = extract_citation_keys_from_text(line_text)
+        records.append(
+            AuditLogRecord(
+                record_index=record_index,
+                line_number=line_number,
+                bib_keys=tuple(bib_keys),
+                line_text=line_text,
+            )
+        )
+        index += 1
+        while index < len(lines) and lines[index].strip() != LOG_SEPARATOR_LINE:
+            index += 1
+        index += 1
+    return records
+
+
+def select_audit_log_record(
+    audit_context: AuditLogContext,
+    log_entry_index: int | None,
+) -> AuditLogRecord:
+    if not audit_context.records:
+        raise RuntimeError(f"No audit log entries found in {audit_context.log_path}")
+    if log_entry_index is None:
+        if len(audit_context.records) == 1:
+            return audit_context.records[0]
+        available = ", ".join(str(record.record_index) for record in audit_context.records)
+        raise RuntimeError(
+            f"Audit log {audit_context.log_path.name} contains multiple entries. "
+            f"Pass --log-entry to pick one of: {available}"
+        )
+
+    for record in audit_context.records:
+        if record.record_index == log_entry_index:
+            return record
+    available = ", ".join(str(record.record_index) for record in audit_context.records)
+    raise RuntimeError(
+        f"Audit log entry {log_entry_index} was not found in {audit_context.log_path.name}. "
+        f"Available entries: {available}"
+    )
+
+
+def write_sanitized_tex_upload(
+    tex_path: Path,
+    record: AuditLogRecord,
+    temp_dir: Path,
+) -> Path:
+    tex_lines = read_candidate_text(tex_path).splitlines(keepends=True)
+    if record.line_number < 1:
+        raise RuntimeError(f"Invalid audit log line number {record.line_number} for {tex_path}")
+    if record.line_number > len(tex_lines):
+        raise RuntimeError(
+            f"Audit log line {record.line_number} exceeds the TeX length {len(tex_lines)} for {tex_path}"
+        )
+
+    truncated_lines = tex_lines[: record.line_number]
+    truncated_lines[-1] = mask_logged_citations_in_line(
+        truncated_lines[-1],
+        record.bib_keys,
+    )
+    output_path = temp_dir / f"{tex_path.stem}_log_{record.record_index}_truncated.tex"
+    output_path.write_text("".join(truncated_lines), encoding="utf-8")
+    return output_path
+
+
+def mask_logged_citations_in_line(line_text: str, bib_keys: Sequence[str]) -> str:
+    occurrences = list(find_macro_occurrences(line_text, set(DEFAULT_CITE_COMMANDS)))
+    if not occurrences:
+        return line_text
+
+    key_set = {key for key in bib_keys if key}
+    target_occurrences = [
+        occurrence
+        for occurrence in occurrences
+        if not key_set or any(key in key_set for key in occurrence.keys)
+    ]
+    if not target_occurrences:
+        return line_text
+
+    chunks: list[str] = []
+    cursor = 0
+    for occurrence in target_occurrences:
+        chunks.append(line_text[cursor : occurrence.start])
+        chunks.append("[Citation Needed]")
+        cursor = occurrence.end
+    chunks.append(line_text[cursor:])
+    return "".join(chunks)
+
+
+def build_bibliography_upload_file(
+    paper_source: str,
+    bib_paths: Sequence[Path],
+    temp_dir: Path,
+    excluded_keys: Sequence[str] = (),
+) -> Path:
+    output_path = temp_dir / f"{sanitize_for_filename(paper_source)}_bibliography.txt"
+    parts: list[str] = []
+    if not bib_paths:
+        parts.append("(no bibliography files provided)\n")
+    for bib_path in bib_paths:
+        parts.append(f"===== {bib_path.name} =====\n")
+        content = read_candidate_text(bib_path)
+        filtered_content = filter_bibliography_text(content, excluded_keys)
+        if filtered_content:
+            parts.append(filtered_content)
+            if not filtered_content.endswith("\n"):
+                parts.append("\n")
+        parts.append("\n")
+    output_path.write_text("".join(parts), encoding="utf-8")
+    return output_path
+
+
+def filter_bibliography_text(text: str, excluded_keys: Sequence[str]) -> str:
+    key_set = {key.strip() for key in excluded_keys if key.strip()}
+    if not key_set:
+        return text
+
+    bib_entries = list(iter_bib_entries(text))
+    if bib_entries:
+        kept_entries = [
+            raw.rstrip()
+            for key, _, raw in bib_entries
+            if key not in key_set
+        ]
+        return ("\n\n".join(kept_entries) + "\n") if kept_entries else ""
+
+    bbl_entries = list(iter_bbl_entries(text))
+    if bbl_entries:
+        kept_entries = [
+            raw.rstrip()
+            for key, _, raw in bbl_entries
+            if key not in key_set
+        ]
+        return ("\n\n".join(kept_entries) + "\n") if kept_entries else ""
+
+    return text
+
+
+def extract_bib_keys_from_log_line(line: str) -> list[str]:
+    _, _, payload = line.partition("->")
+    if not payload:
+        return []
+    return [
+        match.group(1).strip()
+        for match in ARXIV_CITATION_KEY_RE.finditer(payload)
+        if match.group(1).strip()
+    ]
+
+
+def extract_citation_keys_from_text(text: str) -> list[str]:
+    keys: list[str] = []
+    for occurrence in find_macro_occurrences(text, set(DEFAULT_CITE_COMMANDS)):
+        keys.extend(occurrence.keys)
+    return dedupe_preserving_order(keys)
+
+
+def dedupe_preserving_order(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def sanitize_for_filename(value: str) -> str:
+    cleaned = []
+    for char in value.strip():
+        if char.isalnum() or char in {".", "-", "_"}:
+            cleaned.append(char)
+        else:
+            cleaned.append("_")
+    return "".join(cleaned) or "paper"
+
+
+def create_upload_temp_dir() -> Path:
+    base_dir = (Path.cwd() / ".openai_upload_tmp").resolve()
+    base_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = base_dir / f"tex-mcp-upload-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    temp_dir.mkdir()
+    return temp_dir
+
+
+def cleanup_upload_temp_dir(temp_dir: Path | None) -> None:
+    if temp_dir is None:
+        return
+    resolved = temp_dir.resolve()
+    workspace_root = Path.cwd().resolve()
+    try:
+        resolved.relative_to(workspace_root)
+    except ValueError:
+        return
+    shutil.rmtree(resolved, ignore_errors=True)
+
+
 def main() -> int:
     args = parse_args()
 
     try:
         dotenv_path = load_environment_from_dotenv()
         tex_path = validate_input_path(args.tex_file, expected_suffix=".tex")
-        bib_path = validate_input_path(args.bib_file, expected_suffix=".txt")
+        bib_path = validate_input_path(args.bib_file, expected_suffix=(".txt", ".bib", ".bbl"))
+        resolved_audit_log = (
+            validate_input_path(args.audit_log, expected_suffix=".log")
+            if args.audit_log is not None
+            else None
+        )
         api_key = read_api_key(args.api_key_env)
         langfuse_runtime = setup_langfuse(args)
         client = make_client(api_key, enable_langfuse=langfuse_runtime.enabled)
@@ -230,7 +725,19 @@ def main() -> int:
 
     uploaded_file_ids: list[str] = []
     trace_url: str | None = None
+    upload_temp_dir: Path | None = None
     try:
+        upload_temp_dir = create_upload_temp_dir()
+        upload_inputs = prepare_upload_inputs(
+            tex_path=tex_path,
+            bib_path=bib_path,
+            audit_log_path=resolved_audit_log,
+            log_entry_index=args.log_entry,
+            temp_dir=upload_temp_dir,
+        )
+        for message in upload_inputs.status_messages:
+            print(message, file=sys.stderr)
+
         trace_context = (
             langfuse_runtime.client.start_as_current_observation(
                 name=args.langfuse_trace_name,
@@ -273,8 +780,8 @@ def main() -> int:
                 else nullcontext()
             )
             with propagation_context:
-                tex_upload = upload_file(client, tex_path)
-                bib_upload = upload_file(client, bib_path)
+                tex_upload = upload_file(client, upload_inputs.tex_path)
+                bib_upload = upload_file(client, upload_inputs.bib_path)
                 uploaded_file_ids.extend(
                     [
                         getattr(tex_upload, "id", ""),
@@ -315,12 +822,13 @@ def main() -> int:
                         reasoning_effort=args.reasoning_effort,
                         max_output_tokens=args.max_output_tokens,
                         prompt=build_user_prompt(
-                            tex_path=tex_path,
-                            bib_path=bib_path,
+                            tex_path=upload_inputs.tex_path,
+                            bib_path=upload_inputs.bib_path,
                             user_prompt=args.prompt,
+                            context_note=upload_inputs.prompt_note,
                         ),
-                        tex_upload_id=required_file_id(tex_upload, tex_path),
-                        bib_upload_id=required_file_id(bib_upload, bib_path),
+                        tex_upload_id=required_file_id(tex_upload, upload_inputs.tex_path),
+                        bib_upload_id=required_file_id(bib_upload, upload_inputs.bib_path),
                         mcp_tool=build_mcp_tool(
                             mcp_label=args.mcp_label,
                             mcp_url=args.mcp_url,
@@ -379,6 +887,7 @@ def main() -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
+        cleanup_upload_temp_dir(upload_temp_dir)
         if args.delete_uploads:
             cleanup_uploaded_files(client if "client" in locals() else None, uploaded_file_ids)
         if "langfuse_runtime" in locals() and langfuse_runtime.enabled:
@@ -390,15 +899,28 @@ def main() -> int:
     return 0
 
 
-def validate_input_path(path: Path, expected_suffix: str) -> Path:
+def validate_input_path(
+    path: Path,
+    expected_suffix: str | Sequence[str],
+) -> Path:
     resolved = path.resolve()
     if not resolved.exists():
         raise RuntimeError(f"File not found: {resolved}")
     if not resolved.is_file():
         raise RuntimeError(f"Expected a file, but found: {resolved}")
-    if resolved.suffix.lower() != expected_suffix:
+    expected_suffixes = (
+        tuple(item.lower() for item in expected_suffix)
+        if isinstance(expected_suffix, (list, tuple))
+        else (expected_suffix.lower(),)
+    )
+    if resolved.suffix.lower() not in expected_suffixes:
+        expected_text = (
+            expected_suffixes[0]
+            if len(expected_suffixes) == 1
+            else ", ".join(expected_suffixes)
+        )
         raise RuntimeError(
-            f"Expected a {expected_suffix} file, but got: {resolved.name}"
+            f"Expected one of {expected_text}, but got: {resolved.name}"
         )
     return resolved
 
@@ -513,17 +1035,24 @@ def required_file_id(uploaded_file, path: Path) -> str:
     return file_id
 
 
-def build_user_prompt(tex_path: Path, bib_path: Path, user_prompt: str | None) -> str:
+def build_user_prompt(
+    tex_path: Path,
+    bib_path: Path,
+    user_prompt: str | None,
+    context_note: str | None = None,
+) -> str:
     instruction = user_prompt.strip() if user_prompt else (
         "Read the attached LaTeX source and bibliography, then answer "
         "helpfully. Use theorem_search when it would improve factual or "
         "literature-grounded answers."
     )
+    context_block = f"{context_note.strip()}\n\n" if context_note and context_note.strip() else ""
     return (
         "You are given two uploaded files.\n"
         f"- {tex_path.name}: the LaTeX source file\n"
         f"- {bib_path.name}: the bibliography file\n\n"
         "Treat the uploaded files as the primary project context.\n"
+        f"{context_block}"
         "Your job is to search the database for citations via the search tool. You can call it through the attached MCP server.\n\n"
         "User request:\n"
         f"{instruction}"
