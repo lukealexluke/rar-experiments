@@ -20,6 +20,7 @@ from query_openai_tex_mcp import (
     cleanup_upload_temp_dir,
     create_upload_temp_dir,
     extract_output_text,
+    extract_langfuse_usage_details,
     load_environment_from_dotenv,
     make_client,
     parse_audit_log,
@@ -338,6 +339,10 @@ def main() -> int:
                     "output_text": "",
                     "gpt_name": "",
                     "gpt_ext_source": "",
+                    "response_id": None,
+                    "response_status": None,
+                    "incomplete_details": None,
+                    "usage_details": None,
                     "error": None,
                 }
 
@@ -375,17 +380,34 @@ def main() -> int:
                         mcp_tool=mcp_tool,
                     )
                     output_text = extract_output_text(response, response_data)
+                    usage_details = extract_langfuse_usage_details(response, response_data)
                     gpt_name, gpt_ext_source = parse_gpt_response(output_text)
+                    response_status = str(response_data.get("status") or "")
+                    incomplete_details = response_data.get("incomplete_details")
+                    if response_status == "completed":
+                        status = "ok"
+                    elif response_status:
+                        status = response_status
+                    else:
+                        status = "ok" if output_text else "empty"
                     result.update(
                         {
-                            "status": "ok",
+                            "status": status,
                             "output_text": output_text,
                             "gpt_name": gpt_name,
                             "gpt_ext_source": gpt_ext_source,
                             "response_id": response_data.get("id"),
-                            "response_status": response_data.get("status"),
+                            "response_status": response_status or None,
+                            "incomplete_details": incomplete_details,
+                            "usage_details": usage_details or None,
                         }
                     )
+                    if response_status and response_status != "completed":
+                        print(
+                            f"Warning: {log_path.name} item {record.record_index} returned "
+                            f"response_status={response_status} with no final completion.",
+                            file=sys.stderr,
+                        )
                 except Exception as exc:
                     result["error"] = str(exc)
                     print(
