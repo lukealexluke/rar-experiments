@@ -357,6 +357,20 @@ def normalize_optional_string(value: object) -> str:
     return cleaned
 
 
+def format_exception_message(exc: BaseException) -> str:
+    child_exceptions = getattr(exc, "exceptions", None)
+    if isinstance(child_exceptions, tuple) and child_exceptions:
+        child_messages = [
+            format_exception_message(child)
+            for child in child_exceptions
+            if child is not None
+        ]
+        child_messages = [message for message in child_messages if message]
+        if child_messages:
+            return "; ".join(child_messages)
+    return str(exc)
+
+
 def make_raw_response_path(
     raw_response_dir: Path,
     log_path: Path,
@@ -556,6 +570,7 @@ def run_provider_response(
                 prompt=prompt,
                 tex_upload=tex_upload,
                 bib_upload=bib_upload,
+                mcp_label=args.mcp_label,
                 mcp_url=args.mcp_url,
                 requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
                 mcp_headers=mcp_headers,
@@ -564,7 +579,7 @@ def run_provider_response(
         if thinking_note:
             print(thinking_note, file=sys.stderr)
         print(
-            "MCP tools exposed by server: " + ", ".join(available_tool_names),
+            "Configured MCP tools: " + ", ".join(available_tool_names),
             file=sys.stderr,
         )
         return response, response_data
@@ -737,8 +752,8 @@ def main() -> int:
                                     metadata={
                                         "provider": provider_runtime.name,
                                         "log_file": str(log_path),
-                                        "record_index": record.record_index,
-                                        "line_number": record.line_number,
+                                        "record_index": str(record.record_index),
+                                        "line_number": str(record.line_number),
                                     },
                                 )
                                 if langfuse_runtime.enabled and langfuse_runtime.propagate_attributes
@@ -882,10 +897,11 @@ def main() -> int:
                                             file=sys.stderr,
                                         )
                     except Exception as exc:
-                        result["error"] = str(exc)
+                        result["error"] = format_exception_message(exc)
                         print(
                             f"Warning: {provider_runtime.label} query failed for "
-                            f"{log_path.name} item {record.record_index}: {exc}",
+                            f"{log_path.name} item {record.record_index}: "
+                            f"{format_exception_message(exc)}",
                             file=sys.stderr,
                         )
                     finally:

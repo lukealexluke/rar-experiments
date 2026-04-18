@@ -326,13 +326,11 @@ def resolve_model_pricing(args: argparse.Namespace) -> ModelPricing | None:
 
 def ensure_runtime_dependencies() -> None:
     try:
-        import httpx  # noqa: F401
-        from mcp import ClientSession  # noqa: F401
-        from mcp.client.streamable_http import streamable_http_client  # noqa: F401
+        from google.genai import types  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
-            "The Gemini MCP path requires the `mcp` and `httpx` packages. "
-            "Install them with `pip install mcp httpx`."
+            "The Gemini path requires the `google-genai` package. "
+            "Install it with `pip install google-genai`."
         ) from exc
 
 
@@ -423,70 +421,51 @@ async def run_response(
     prompt: str,
     tex_upload,
     bib_upload,
+    mcp_label: str,
     mcp_url: str,
     requested_tools: list[str],
     mcp_headers: dict[str, str],
 ):
     try:
-        import httpx
-        from mcp import ClientSession
-        from mcp.client.streamable_http import streamable_http_client
         from google.genai import types
     except ImportError as exc:
         raise RuntimeError(
-            "Missing Gemini MCP runtime dependency. Install `google-genai`, `mcp`, "
-            "and `httpx`."
+            "Missing Gemini runtime dependency. Install `google-genai`."
         ) from exc
 
     thinking_config, thinking_note = build_thinking_config(model, reasoning_effort)
-
-    async with httpx.AsyncClient(
-        headers=mcp_headers or None,
-        follow_redirects=True,
-    ) as http_client:
-        async with streamable_http_client(mcp_url, http_client=http_client) as (
-            read_stream,
-            write_stream,
-            _,
-        ):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                tool_listing = await session.list_tools()
-                available_tool_names = [tool.name for tool in tool_listing.tools]
-
-                missing_tools = [
-                    tool_name
-                    for tool_name in requested_tools
-                    if tool_name not in available_tool_names
-                ]
-                if missing_tools:
-                    raise RuntimeError(
-                        "Requested MCP tool(s) were not exposed by the server: "
-                        + ", ".join(missing_tools)
-                        + ". Available tools: "
-                        + ", ".join(available_tool_names)
+    config = types.GenerateContentConfig(
+        system_instruction=build_system_prompt(),
+        max_output_tokens=max_output_tokens,
+        thinking_config=thinking_config,
+        tools=[
+            types.Tool(
+                mcp_servers=[
+                    types.McpServer(
+                        name=mcp_label,
+                        streamable_http_transport=types.StreamableHttpTransport(
+                            url=mcp_url,
+                            headers=mcp_headers or None,
+                        ),
                     )
-
-                config = types.GenerateContentConfig(
-                    system_instruction=build_system_prompt(),
-                    max_output_tokens=max_output_tokens,
-                    thinking_config=thinking_config,
-                    tools=[session],
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(
-                            allowed_function_names=requested_tools,
-                        )
-                    ),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        maximum_remote_calls=DEFAULT_APPROVAL_LIMIT,
-                    ),
-                )
-                response = await client.aio.models.generate_content(
-                    model=model,
-                    contents=[prompt, tex_upload, bib_upload],
-                    config=config,
-                )
-    return response, to_dict(response), available_tool_names, thinking_note
+                ]
+            )
+        ],
+        tool_config=types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(
+                allowed_function_names=requested_tools,
+            )
+        ),
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            maximum_remote_calls=DEFAULT_APPROVAL_LIMIT,
+        ),
+    )
+    response = await client.aio.models.generate_content(
+        model=model,
+        contents=[prompt, tex_upload, bib_upload],
+        config=config,
+    )
+    return response, to_dict(response), requested_tools, thinking_note
 
 
 def extract_output_text(response, response_data: dict[str, Any]) -> str:
@@ -580,6 +559,20 @@ def to_dict(response) -> dict[str, Any]:
     if isinstance(data, dict):
         return data
     raise RuntimeError("Could not convert the Gemini response object to a dictionary.")
+
+
+def format_exception_message(exc: BaseException) -> str:
+    child_exceptions = getattr(exc, "exceptions", None)
+    if isinstance(child_exceptions, tuple) and child_exceptions:
+        child_messages = [
+            format_exception_message(child)
+            for child in child_exceptions
+            if child is not None
+        ]
+        child_messages = [message for message in child_messages if message]
+        if child_messages:
+            return "; ".join(child_messages)
+    return str(exc)
 
 
 def main() -> int:
@@ -717,6 +710,7 @@ def main() -> int:
                             ),
                             tex_upload=tex_upload,
                             bib_upload=bib_upload,
+                            mcp_label=args.mcp_label,
                             mcp_url=args.mcp_url,
                             requested_tools=mcp_tools,
                             mcp_headers=mcp_headers,
@@ -726,7 +720,7 @@ def main() -> int:
                     if thinking_note:
                         print(thinking_note, file=sys.stderr)
                     print(
-                        "MCP tools exposed by server: " + ", ".join(available_tool_names),
+                        "Configured MCP tools: " + ", ".join(available_tool_names),
                         file=sys.stderr,
                     )
 
@@ -777,7 +771,7 @@ def main() -> int:
                     if args.json_output:
                         write_json_output(args.json_output, response_data)
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error: {format_exception_message(exc)}", file=sys.stderr)
         return 1
     finally:
         cleanup_upload_temp_dir(upload_temp_dir)
