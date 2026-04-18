@@ -2,44 +2,32 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from contextlib import nullcontext
+from dataclasses import dataclass
 import json
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
+import query_gemini_tex_mcp as gemini_query
+import query_openai_tex_mcp as openai_query
 from query_openai_tex_mcp import (
     DEFAULT_ALLOWED_MCP_TOOLS,
-    DEFAULT_API_KEY_ENV,
     DEFAULT_LANGFUSE_TRACE_NAME,
-    DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MCP_LABEL,
     DEFAULT_MCP_URL,
-    DEFAULT_MODEL,
-    DEFAULT_REASONING_EFFORT,
-    build_mcp_tool,
-    build_langfuse_generation_output,
     build_langfuse_generation_result_metadata,
     build_langfuse_model_parameters,
-    cleanup_uploaded_files,
-    cleanup_upload_temp_dir,
     compute_langfuse_cost_details,
-    create_upload_temp_dir,
-    extract_output_text,
-    extract_langfuse_usage_details,
     flush_langfuse,
     load_environment_from_dotenv,
-    make_client,
     parse_audit_log,
     parse_mcp_headers,
     prepare_upload_inputs,
     read_api_key,
-    required_file_id,
-    resolve_model_pricing,
-    run_response,
     setup_langfuse,
-    upload_file,
 )
 
 CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
@@ -48,14 +36,51 @@ FALLBACK_LOGS_DIRS = (
     Path("random_arxiv_source_samples") / "statement_reference_audit_logs",
 )
 DEFAULT_BATCH_LANGFUSE_TRACE_NAME = f"{DEFAULT_LANGFUSE_TRACE_NAME}-batch"
+DEFAULT_PROVIDER = "openai"
+
+
+@dataclass(frozen=True)
+class ProviderRuntime:
+    name: str
+    label: str
+    module: Any
+    generation_observation_name: str
+    default_output_log_name: str
+    default_raw_response_dir_name: str
+
+
+PROVIDER_RUNTIMES: dict[str, ProviderRuntime] = {
+    "openai": ProviderRuntime(
+        name="openai",
+        label="OpenAI",
+        module=openai_query,
+        generation_observation_name="openai.responses.create",
+        default_output_log_name="openai_query_results.jsonl",
+        default_raw_response_dir_name="raw_openai_responses",
+    ),
+    "gemini": ProviderRuntime(
+        name="gemini",
+        label="Gemini",
+        module=gemini_query,
+        generation_observation_name="google.genai.models.generate_content",
+        default_output_log_name="gemini_query_results.jsonl",
+        default_raw_response_dir_name="raw_gemini_responses",
+    ),
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run query_openai_tex_mcp-style GPT queries over every audit-log entry in a "
+            "Run theorem-citation queries over every audit-log entry in a "
             "statement_reference_audit_logs directory and write one JSON result per line."
         )
+    )
+    parser.add_argument(
+        "--provider",
+        choices=tuple(PROVIDER_RUNTIMES),
+        default=DEFAULT_PROVIDER,
+        help=f"Model provider to use. Defaults to {DEFAULT_PROVIDER}.",
     )
     parser.add_argument(
         "--logs-dir",
@@ -78,13 +103,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-log",
         type=Path,
-        help="Output JSONL log path. Defaults to <logs-dir>/openai_query_results.jsonl.",
+        help="Output JSONL log path. Defaults to a provider-specific file under <logs-dir>.",
     )
     parser.add_argument(
         "--raw-response-dir",
         type=Path,
         help=(
-            "Optional directory where raw OpenAI response JSON files are written for "
+            "Optional directory where raw provider response JSON files are written for "
             "items that do not complete cleanly."
         ),
     )
@@ -98,25 +123,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help=f"OpenAI model to use. Defaults to {DEFAULT_MODEL}.",
+        help="Model to use. Defaults to the selected provider's default model.",
     )
     parser.add_argument(
         "--reasoning-effort",
         choices=("none", "low", "medium", "high", "xhigh"),
-        default=DEFAULT_REASONING_EFFORT,
-        help=f"Reasoning effort. Defaults to {DEFAULT_REASONING_EFFORT}.",
+        help="Reasoning effort. Defaults to the selected provider's default value.",
     )
     parser.add_argument(
         "--max-output-tokens",
         type=int,
-        default=DEFAULT_MAX_OUTPUT_TOKENS,
-        help=f"Maximum output tokens. Defaults to {DEFAULT_MAX_OUTPUT_TOKENS}.",
+        help="Maximum output tokens. Defaults to the selected provider's default value.",
     )
     parser.add_argument(
         "--api-key-env",
-        default=DEFAULT_API_KEY_ENV,
-        help=f"Environment variable containing the OpenAI API key. Defaults to {DEFAULT_API_KEY_ENV}.",
+        help=(
+            "Environment variable containing the provider API key. Defaults to the "
+            "selected provider's default value."
+        ),
     )
     parser.add_argument(
         "--mcp-url",
@@ -186,7 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--delete-uploads",
         action="store_true",
-        help="Delete uploaded OpenAI files after each query finishes.",
+        help="Delete uploaded provider files after each query finishes.",
     )
     parser.add_argument(
         "--overwrite",
@@ -199,6 +223,25 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap on the total number of audit-log entries to query.",
     )
     return parser.parse_args()
+
+
+def resolve_provider_runtime(provider_name: str) -> ProviderRuntime:
+    return PROVIDER_RUNTIMES[provider_name]
+
+
+def apply_provider_defaults(
+    args: argparse.Namespace,
+    provider_runtime: ProviderRuntime,
+) -> argparse.Namespace:
+    if args.model is None:
+        args.model = provider_runtime.module.DEFAULT_MODEL
+    if args.reasoning_effort is None:
+        args.reasoning_effort = provider_runtime.module.DEFAULT_REASONING_EFFORT
+    if args.max_output_tokens is None:
+        args.max_output_tokens = provider_runtime.module.DEFAULT_MAX_OUTPUT_TOKENS
+    if args.api_key_env is None:
+        args.api_key_env = provider_runtime.module.DEFAULT_API_KEY_ENV
+    return args
 
 
 def sorted_log_paths(logs_dir: Path) -> list[Path]:
@@ -323,6 +366,7 @@ def make_raw_response_path(
 
 
 def build_langfuse_batch_span_input(
+    provider_name: str,
     log_path: Path,
     record_index: int,
     line_number: int,
@@ -336,6 +380,7 @@ def build_langfuse_batch_span_input(
     mcp_tools: list[str],
 ) -> dict[str, Any]:
     return {
+        "provider": provider_name,
         "log_file": str(log_path),
         "record_index": record_index,
         "line_number": line_number,
@@ -353,12 +398,14 @@ def build_langfuse_batch_span_input(
 
 
 def build_langfuse_batch_span_metadata(
+    provider_name: str,
     log_path: Path,
     record_index: int,
     line_number: int,
     output_log: Path,
 ) -> dict[str, Any]:
     return {
+        "provider": provider_name,
         "log_file": str(log_path),
         "record_index": record_index,
         "line_number": line_number,
@@ -378,17 +425,158 @@ def build_langfuse_batch_span_output(
     result_status: str,
 ) -> dict[str, Any]:
     return {
-        "response_id": response_data.get("id"),
+        "response_id": extract_response_id(response_data),
         "status": result_status,
-        "response_status": response_data.get("status"),
+        "response_status": extract_response_status(response_data),
         "output_text": output_text or None,
         "usage_details": usage_details or None,
         "cost_details": cost_details or None,
     }
 
 
+def build_langfuse_generation_output(
+    response_data: dict[str, Any],
+    output_text: str,
+    usage_details: dict[str, int],
+    cost_details: dict[str, float],
+) -> dict[str, Any]:
+    return {
+        "response_id": extract_response_id(response_data),
+        "status": extract_response_status(response_data) or None,
+        "output_text": output_text or None,
+        "usage_details": usage_details or None,
+        "cost_details": cost_details or None,
+    }
+
+
+def extract_response_id(response_data: dict[str, Any]) -> str | None:
+    response_id = normalize_optional_string(
+        response_data.get("id") or response_data.get("response_id")
+    )
+    return response_id or None
+
+
+def extract_candidate_finish_reasons(response_data: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    for candidate in response_data.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        reason = normalize_optional_string(candidate.get("finish_reason"))
+        if reason and reason not in reasons:
+            reasons.append(reason)
+    return reasons
+
+
+def extract_response_status(response_data: dict[str, Any]) -> str:
+    direct_status = normalize_optional_string(response_data.get("status"))
+    if direct_status:
+        return direct_status
+
+    prompt_feedback = response_data.get("prompt_feedback")
+    if isinstance(prompt_feedback, dict):
+        block_reason = normalize_optional_string(prompt_feedback.get("block_reason"))
+        if block_reason:
+            return f"blocked:{block_reason}"
+
+    finish_reasons = extract_candidate_finish_reasons(response_data)
+    if not finish_reasons:
+        return ""
+
+    normalized = {reason.lower() for reason in finish_reasons}
+    if normalized == {"stop"}:
+        return "completed"
+    return ",".join(finish_reasons)
+
+
+def derive_result_status(response_status: str, output_text: str) -> str:
+    normalized = response_status.strip().lower()
+    if normalized == "completed":
+        return "ok"
+    if normalized.startswith("blocked"):
+        return "blocked"
+    if normalized:
+        return normalized
+    return "ok" if output_text else "empty"
+
+
+def maybe_ensure_provider_dependencies(provider_runtime: ProviderRuntime) -> None:
+    ensure_runtime_dependencies = getattr(provider_runtime.module, "ensure_runtime_dependencies", None)
+    if callable(ensure_runtime_dependencies):
+        ensure_runtime_dependencies()
+
+
+def upload_file_refs(provider_runtime: ProviderRuntime, tex_upload, bib_upload) -> list[str]:
+    ref_attribute = "id" if provider_runtime.name == "openai" else "name"
+    return [
+        ref
+        for ref in (
+            getattr(tex_upload, ref_attribute, ""),
+            getattr(bib_upload, ref_attribute, ""),
+        )
+        if ref
+    ]
+
+
+def run_provider_response(
+    provider_runtime: ProviderRuntime,
+    client,
+    args: argparse.Namespace,
+    prompt: str,
+    tex_upload,
+    bib_upload,
+    tex_upload_path: Path,
+    bib_upload_path: Path,
+    mcp_headers: dict[str, str],
+):
+    if provider_runtime.name == "openai":
+        mcp_tool = provider_runtime.module.build_mcp_tool(
+            mcp_label=args.mcp_label,
+            mcp_url=args.mcp_url,
+            mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+            mcp_headers=mcp_headers,
+        )
+        return provider_runtime.module.run_response(
+            client=client,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            max_output_tokens=args.max_output_tokens,
+            prompt=prompt,
+            tex_upload_id=provider_runtime.module.required_file_id(tex_upload, tex_upload_path),
+            bib_upload_id=provider_runtime.module.required_file_id(bib_upload, bib_upload_path),
+            mcp_tool=mcp_tool,
+        )
+
+    if provider_runtime.name == "gemini":
+        response, response_data, available_tool_names, thinking_note = asyncio.run(
+            provider_runtime.module.run_response(
+                client=client,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+                max_output_tokens=args.max_output_tokens,
+                prompt=prompt,
+                tex_upload=tex_upload,
+                bib_upload=bib_upload,
+                mcp_url=args.mcp_url,
+                requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                mcp_headers=mcp_headers,
+            )
+        )
+        if thinking_note:
+            print(thinking_note, file=sys.stderr)
+        print(
+            "MCP tools exposed by server: " + ", ".join(available_tool_names),
+            file=sys.stderr,
+        )
+        return response, response_data
+
+    raise RuntimeError(f"Unsupported provider: {provider_runtime.name}")
+
+
 def main() -> int:
     args = parse_args()
+    provider_runtime = resolve_provider_runtime(args.provider)
+    args = apply_provider_defaults(args, provider_runtime)
+
     try:
         logs_dir = resolve_logs_dir(args.logs_dir)
     except RuntimeError as exc:
@@ -399,7 +587,9 @@ def main() -> int:
         return 1
 
     search_root = (args.search_root or logs_dir.parent).resolve()
-    output_log = (args.output_log or (logs_dir / "openai_query_results.jsonl")).resolve()
+    output_log = (
+        args.output_log or (logs_dir / provider_runtime.default_output_log_name)
+    ).resolve()
     if output_log.exists() and not args.overwrite:
         print(
             f"Error: output log already exists: {output_log}. Use --overwrite to replace it.",
@@ -407,15 +597,20 @@ def main() -> int:
         )
         return 1
     raw_response_dir = (
-        (args.raw_response_dir or (output_log.parent / "raw_openai_responses")).resolve()
-    )
+        args.raw_response_dir
+        or (output_log.parent / provider_runtime.default_raw_response_dir_name)
+    ).resolve()
 
     try:
         dotenv_path = load_environment_from_dotenv()
         api_key = read_api_key(args.api_key_env)
         langfuse_runtime = setup_langfuse(args)
-        pricing = resolve_model_pricing(args)
-        client = make_client(api_key, enable_langfuse=langfuse_runtime.enabled)
+        maybe_ensure_provider_dependencies(provider_runtime)
+        pricing = provider_runtime.module.resolve_model_pricing(args)
+        client = provider_runtime.module.make_client(
+            api_key,
+            enable_langfuse=langfuse_runtime.enabled,
+        )
         mcp_headers = parse_mcp_headers(args.mcp_headers or [])
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -426,13 +621,7 @@ def main() -> int:
     if langfuse_runtime.status_message:
         print(langfuse_runtime.status_message, file=sys.stderr)
 
-    mcp_tool = build_mcp_tool(
-        mcp_label=args.mcp_label,
-        mcp_url=args.mcp_url,
-        mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
-        mcp_headers=mcp_headers,
-    )
-
+    mcp_tools = args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS)
     log_paths = sorted_log_paths(logs_dir)
     if not log_paths:
         print(f"Error: no log files found in {logs_dir}", file=sys.stderr)
@@ -472,8 +661,9 @@ def main() -> int:
                         break
 
                     upload_temp_dir: Path | None = None
-                    uploaded_file_ids: list[str] = []
+                    uploaded_file_refs: list[str] = []
                     result: dict[str, object] = {
+                        "provider": provider_runtime.name,
                         "log_file": str(log_path),
                         "record_index": record.record_index,
                         "line_number": record.line_number,
@@ -493,7 +683,7 @@ def main() -> int:
                     }
 
                     try:
-                        upload_temp_dir = create_upload_temp_dir()
+                        upload_temp_dir = provider_runtime.module.create_upload_temp_dir()
                         upload_inputs = prepare_upload_inputs(
                             tex_path=tex_path,
                             bib_path=fallback_bib_path,
@@ -513,6 +703,7 @@ def main() -> int:
                                 name=args.langfuse_trace_name,
                                 as_type="span",
                                 input=build_langfuse_batch_span_input(
+                                    provider_name=provider_runtime.name,
                                     log_path=log_path,
                                     record_index=record.record_index,
                                     line_number=record.line_number,
@@ -523,9 +714,10 @@ def main() -> int:
                                     max_output_tokens=args.max_output_tokens,
                                     mcp_url=args.mcp_url,
                                     mcp_label=args.mcp_label,
-                                    mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                                    mcp_tools=mcp_tools,
                                 ),
                                 metadata=build_langfuse_batch_span_metadata(
+                                    provider_name=provider_runtime.name,
                                     log_path=log_path,
                                     record_index=record.record_index,
                                     line_number=record.line_number,
@@ -543,6 +735,7 @@ def main() -> int:
                                     tags=args.langfuse_tags,
                                     trace_name=args.langfuse_trace_name,
                                     metadata={
+                                        "provider": provider_runtime.name,
                                         "log_file": str(log_path),
                                         "record_index": record.record_index,
                                         "line_number": record.line_number,
@@ -554,9 +747,10 @@ def main() -> int:
                             with propagation_context:
                                 generation_context = (
                                     langfuse_runtime.client.start_as_current_observation(
-                                        name="openai.responses.create",
+                                        name=provider_runtime.generation_observation_name,
                                         as_type="generation",
                                         input={
+                                            "provider": provider_runtime.name,
                                             "log_file": str(log_path),
                                             "record_index": record.record_index,
                                             "line_number": record.line_number,
@@ -567,10 +761,11 @@ def main() -> int:
                                                 "web_search_enabled": False,
                                                 "mcp_label": args.mcp_label,
                                                 "mcp_url": args.mcp_url,
-                                                "allowed_tools": args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                                                "allowed_tools": mcp_tools,
                                             },
                                         },
                                         metadata={
+                                            "provider": provider_runtime.name,
                                             "log_file": str(log_path),
                                             "record_index": record.record_index,
                                             "line_number": record.line_number,
@@ -588,43 +783,48 @@ def main() -> int:
                                     else nullcontext(None)
                                 )
                                 with generation_context as generation_observation:
-                                    tex_upload = upload_file(client, upload_inputs.tex_path)
-                                    bib_upload = upload_file(client, upload_inputs.bib_path)
-                                    uploaded_file_ids.extend(
-                                        [
-                                            getattr(tex_upload, "id", ""),
-                                            getattr(bib_upload, "id", ""),
-                                        ]
+                                    tex_upload = provider_runtime.module.upload_file(
+                                        client,
+                                        upload_inputs.tex_path,
                                     )
-                                    response, response_data = run_response(
+                                    bib_upload = provider_runtime.module.upload_file(
+                                        client,
+                                        upload_inputs.bib_path,
+                                    )
+                                    uploaded_file_refs.extend(
+                                        upload_file_refs(provider_runtime, tex_upload, bib_upload)
+                                    )
+                                    response, response_data = run_provider_response(
+                                        provider_runtime=provider_runtime,
                                         client=client,
-                                        model=args.model,
-                                        reasoning_effort=args.reasoning_effort,
-                                        max_output_tokens=args.max_output_tokens,
+                                        args=args,
                                         prompt=prompt,
-                                        tex_upload_id=required_file_id(tex_upload, upload_inputs.tex_path),
-                                        bib_upload_id=required_file_id(bib_upload, upload_inputs.bib_path),
-                                        mcp_tool=mcp_tool,
+                                        tex_upload=tex_upload,
+                                        bib_upload=bib_upload,
+                                        tex_upload_path=upload_inputs.tex_path,
+                                        bib_upload_path=upload_inputs.bib_path,
+                                        mcp_headers=mcp_headers,
                                     )
-                                    output_text = extract_output_text(response, response_data)
-                                    usage_details = extract_langfuse_usage_details(response, response_data)
+                                    output_text = provider_runtime.module.extract_output_text(
+                                        response,
+                                        response_data,
+                                    )
+                                    usage_details = provider_runtime.module.extract_langfuse_usage_details(
+                                        response,
+                                        response_data,
+                                    )
                                     cost_details = compute_langfuse_cost_details(usage_details, pricing)
                                     gpt_name, gpt_ext_source = parse_gpt_response(output_text)
-                                    response_status = str(response_data.get("status") or "")
+                                    response_status = extract_response_status(response_data)
                                     incomplete_details = response_data.get("incomplete_details")
-                                    if response_status == "completed":
-                                        status = "ok"
-                                    elif response_status:
-                                        status = response_status
-                                    else:
-                                        status = "ok" if output_text else "empty"
+                                    status = derive_result_status(response_status, output_text)
                                     result.update(
                                         {
                                             "status": status,
                                             "output_text": output_text,
                                             "gpt_name": gpt_name,
                                             "gpt_ext_source": gpt_ext_source,
-                                            "response_id": response_data.get("id"),
+                                            "response_id": extract_response_id(response_data),
                                             "response_status": response_status or None,
                                             "incomplete_details": incomplete_details,
                                             "usage_details": usage_details or None,
@@ -660,7 +860,7 @@ def main() -> int:
                                                 result_status=status,
                                             )
                                         )
-                                    if response_status != "completed":
+                                    if status != "ok":
                                         raw_response_path = make_raw_response_path(
                                             raw_response_dir=raw_response_dir,
                                             log_path=log_path,
@@ -671,24 +871,30 @@ def main() -> int:
                                             encoding="utf-8",
                                         )
                                         result["raw_response_file"] = str(raw_response_path)
-                                    if response_status and response_status != "completed":
                                         print(
                                             f"Warning: {log_path.name} item {record.record_index} returned "
-                                            f"response_status={response_status} with no final completion.",
+                                            f"status={status}"
+                                            + (
+                                                f" (response_status={response_status})."
+                                                if response_status
+                                                else "."
+                                            ),
                                             file=sys.stderr,
                                         )
                     except Exception as exc:
                         result["error"] = str(exc)
-                        if result["raw_response_file"] is None:
-                            result["raw_response_file"] = None
                         print(
-                            f"Warning: GPT query failed for {log_path.name} item {record.record_index}: {exc}",
+                            f"Warning: {provider_runtime.label} query failed for "
+                            f"{log_path.name} item {record.record_index}: {exc}",
                             file=sys.stderr,
                         )
                     finally:
-                        cleanup_upload_temp_dir(upload_temp_dir)
+                        provider_runtime.module.cleanup_upload_temp_dir(upload_temp_dir)
                         if args.delete_uploads:
-                            cleanup_uploaded_files(client, uploaded_file_ids)
+                            provider_runtime.module.cleanup_uploaded_files(
+                                client,
+                                uploaded_file_refs,
+                            )
 
                     handle.write(json.dumps(result, ensure_ascii=False) + "\n")
                     handle.flush()
@@ -696,8 +902,13 @@ def main() -> int:
     finally:
         if "langfuse_runtime" in locals() and langfuse_runtime.enabled:
             flush_langfuse(langfuse_runtime)
+        if "client" in locals():
+            try:
+                client.close()
+            except Exception:
+                pass
 
-    print(f"Wrote {processed_items} result(s) to {output_log}")
+    print(f"Wrote {processed_items} {provider_runtime.label} result(s) to {output_log}")
     return 0
 
 
