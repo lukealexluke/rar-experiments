@@ -576,7 +576,9 @@ def run_provider_response(
         if thinking_note:
             print(thinking_note, file=sys.stderr)
         print(
-            "Configured MCP tools: " + ", ".join(available_tool_names),
+            "Requested MCP tools: "
+            + ", ".join(available_tool_names)
+            + " (Gemini server-side MCP does not enforce client-side tool allowlists).",
             file=sys.stderr,
         )
         return response, response_data

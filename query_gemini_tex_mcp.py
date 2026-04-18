@@ -459,15 +459,6 @@ def run_response(
                 ]
             )
         ],
-        tool_config=types.ToolConfig(
-            function_calling_config=types.FunctionCallingConfig(
-                mode=types.FunctionCallingConfigMode.ANY,
-                allowed_function_names=requested_tools,
-            )
-        ),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-            maximum_remote_calls=DEFAULT_APPROVAL_LIMIT,
-        ),
     )
     response = client.models.generate_content(
         model=model,
@@ -726,7 +717,9 @@ def main() -> int:
                     if thinking_note:
                         print(thinking_note, file=sys.stderr)
                     print(
-                        "Configured MCP tools: " + ", ".join(available_tool_names),
+                        "Requested MCP tools: "
+                        + ", ".join(available_tool_names)
+                        + " (Gemini server-side MCP does not enforce client-side tool allowlists).",
                         file=sys.stderr,
                     )
 
