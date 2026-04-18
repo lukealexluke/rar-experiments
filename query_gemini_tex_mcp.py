@@ -46,7 +46,7 @@ from query_openai_tex_mcp import (
 
 
 DEFAULT_API_KEY_ENV = "GOOGLE_API_KEY"
-DEFAULT_MODEL = "gemini-2.5-pro"
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_GEMINI_INPUT_COST_ENV = "GEMINI_INPUT_COST_PER_1M"
 DEFAULT_GEMINI_CACHED_INPUT_COST_ENV = "GEMINI_CACHED_INPUT_COST_PER_1M"
@@ -469,10 +469,6 @@ def run_response(
 
 
 def extract_output_text(response, response_data: dict[str, Any]) -> str:
-    output_text = getattr(response, "text", None)
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-
     text_chunks: list[str] = []
     for candidate in response_data.get("candidates", []):
         if not isinstance(candidate, dict):
