@@ -471,7 +471,10 @@ def extract_response_id(response_data: dict[str, Any]) -> str | None:
 
 def extract_candidate_finish_reasons(response_data: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
-    for candidate in response_data.get("candidates", []):
+    candidates = response_data.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = []
+    for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
         reason = normalize_optional_string(candidate.get("finish_reason"))

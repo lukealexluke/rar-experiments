@@ -470,13 +470,19 @@ def run_response(
 
 def extract_output_text(response, response_data: dict[str, Any]) -> str:
     text_chunks: list[str] = []
-    for candidate in response_data.get("candidates", []):
+    candidates = response_data.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = []
+    for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
         content = candidate.get("content")
         if not isinstance(content, dict):
             continue
-        for part in content.get("parts", []):
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            parts = []
+        for part in parts:
             if not isinstance(part, dict):
                 continue
             if part.get("thought"):
