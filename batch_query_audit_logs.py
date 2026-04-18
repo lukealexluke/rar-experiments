@@ -578,12 +578,21 @@ def run_provider_response(
         )
         if thinking_note:
             print(thinking_note, file=sys.stderr)
-        print(
-            "Requested MCP tools: "
-            + ", ".join(available_tool_names)
-            + " (Gemini server-side MCP does not enforce client-side tool allowlists).",
-            file=sys.stderr,
-        )
+        requested_tools = args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS)
+        if available_tool_names == requested_tools:
+            print(
+                "MCP session tools: " + ", ".join(available_tool_names) + ".",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Requested MCP tools: "
+                + ", ".join(requested_tools)
+                + "; MCP session exposes: "
+                + ", ".join(available_tool_names)
+                + " (Gemini SDK MCP sessions do not enforce client-side tool allowlists).",
+                file=sys.stderr,
+            )
         return response, response_data
 
     raise RuntimeError(f"Unsupported provider: {provider_runtime.name}")

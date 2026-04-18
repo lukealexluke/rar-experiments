@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from contextlib import nullcontext
+from dataclasses import dataclass
 import json
 import os
 import sys
@@ -75,6 +77,19 @@ DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
         source="Gemini Developer API pricing as of 2026-04-18",
     ),
 }
+
+
+@dataclass
+class GeminiClientHandle:
+    api_key: str
+    sync_client: Any
+
+    @property
+    def files(self):
+        return self.sync_client.files
+
+    def close(self) -> None:
+        self.sync_client.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -326,10 +341,13 @@ def resolve_model_pricing(args: argparse.Namespace) -> ModelPricing | None:
 def ensure_runtime_dependencies() -> None:
     try:
         from google.genai import types  # noqa: F401
+        import httpx  # noqa: F401
+        from mcp import ClientSession  # noqa: F401
+        from mcp.client.streamable_http import streamable_http_client  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
-            "The Gemini path requires the `google-genai` package. "
-            "Install it with `pip install google-genai`."
+            "The Gemini path requires the `google-genai` and `mcp` packages. "
+            "Install them with `pip install google-genai mcp`."
         ) from exc
 
 
@@ -341,7 +359,10 @@ def make_client(api_key: str, *, enable_langfuse: bool):
             "The `google-genai` package is not installed. Install it with "
             "`pip install google-genai` and rerun the script."
         ) from exc
-    return genai.Client(api_key=api_key)
+    return GeminiClientHandle(
+        api_key=api_key,
+        sync_client=genai.Client(api_key=api_key),
+    )
 
 
 def upload_file(client, path: Path):
@@ -422,6 +443,36 @@ def build_thinking_config(model: str, reasoning_effort: str):
 
 
 def run_response(
+    client: GeminiClientHandle,
+    model: str,
+    reasoning_effort: str,
+    max_output_tokens: int,
+    prompt: str,
+    tex_upload,
+    bib_upload,
+    mcp_label: str,
+    mcp_url: str,
+    requested_tools: list[str],
+    mcp_headers: dict[str, str],
+):
+    return asyncio.run(
+        _run_response_async(
+            client=client,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+            prompt=prompt,
+            tex_upload=tex_upload,
+            bib_upload=bib_upload,
+            mcp_label=mcp_label,
+            mcp_url=mcp_url,
+            requested_tools=requested_tools,
+            mcp_headers=mcp_headers,
+        )
+    )
+
+
+async def _run_response_async(
     client,
     model: str,
     reasoning_effort: str,
@@ -435,37 +486,56 @@ def run_response(
     mcp_headers: dict[str, str],
 ):
     try:
+        import httpx
+        from google import genai
         from google.genai import types
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
     except ImportError as exc:
         raise RuntimeError(
-            "Missing Gemini runtime dependency. Install `google-genai`."
+            "Missing Gemini runtime dependency. Install `google-genai` and `mcp`."
         ) from exc
 
     thinking_config, thinking_note = build_thinking_config(model, reasoning_effort)
-    config = types.GenerateContentConfig(
-        system_instruction=build_system_prompt(),
-        max_output_tokens=max_output_tokens,
-        thinking_config=thinking_config,
-        tools=[
-            types.Tool(
-                mcp_servers=[
-                    types.McpServer(
-                        name=mcp_label,
-                        streamable_http_transport=types.StreamableHttpTransport(
-                            url=mcp_url,
-                            headers=mcp_headers or None,
-                        ),
+    http_client = httpx.AsyncClient(
+        headers=mcp_headers or None,
+        follow_redirects=True,
+    )
+    async_client = genai.Client(api_key=client.api_key).aio
+    try:
+        async with http_client:
+            async with streamable_http_client(
+                mcp_url,
+                http_client=http_client,
+                terminate_on_close=False,
+            ) as (read, write, _get_session_id):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    list_tools_result = await session.list_tools()
+                    available_tool_names = [
+                        tool.name
+                        for tool in getattr(list_tools_result, "tools", [])
+                        if getattr(tool, "name", "")
+                    ]
+                    config = types.GenerateContentConfig(
+                        system_instruction=build_system_prompt(),
+                        max_output_tokens=max_output_tokens,
+                        thinking_config=thinking_config,
+                        tools=[session],
                     )
-                ]
-            )
-        ],
-    )
-    response = client.models.generate_content(
-        model=model,
-        contents=[prompt, tex_upload, bib_upload],
-        config=config,
-    )
-    return response, to_dict(response), requested_tools, thinking_note
+                    response = await async_client.models.generate_content(
+                        model=model,
+                        contents=[prompt, tex_upload, bib_upload],
+                        config=config,
+                    )
+                    return (
+                        response,
+                        to_dict(response),
+                        available_tool_names or requested_tools,
+                        thinking_note,
+                    )
+    finally:
+        await async_client.aclose()
 
 
 def extract_output_text(response, response_data: dict[str, Any]) -> str:
@@ -718,12 +788,20 @@ def main() -> int:
                     )
                     if thinking_note:
                         print(thinking_note, file=sys.stderr)
-                    print(
-                        "Requested MCP tools: "
-                        + ", ".join(available_tool_names)
-                        + " (Gemini server-side MCP does not enforce client-side tool allowlists).",
-                        file=sys.stderr,
-                    )
+                    if available_tool_names == mcp_tools:
+                        print(
+                            "MCP session tools: " + ", ".join(available_tool_names) + ".",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Requested MCP tools: "
+                            + ", ".join(mcp_tools)
+                            + "; MCP session exposes: "
+                            + ", ".join(available_tool_names)
+                            + " (Gemini SDK MCP sessions do not enforce client-side tool allowlists).",
+                            file=sys.stderr,
+                        )
 
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
