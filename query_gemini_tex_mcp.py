@@ -346,7 +346,16 @@ def make_client(api_key: str, *, enable_langfuse: bool):
 
 
 def upload_file(client, path: Path):
-    return client.files.upload(file=str(path))
+    from google.genai import types
+
+    mime_type = "text/plain" if path.suffix.lower() in {".tex", ".txt", ".bib", ".bbl"} else None
+    return client.files.upload(
+        file=str(path),
+        config=types.UploadFileConfig(
+            mime_type=mime_type,
+            display_name=path.name,
+        ),
+    )
 
 
 def cleanup_uploaded_files(client, uploaded_file_names: list[str]) -> None:
