@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 from contextlib import nullcontext
 from dataclasses import dataclass
 import json
@@ -561,20 +560,18 @@ def run_provider_response(
         )
 
     if provider_runtime.name == "gemini":
-        response, response_data, available_tool_names, thinking_note = asyncio.run(
-            provider_runtime.module.run_response(
-                client=client,
-                model=args.model,
-                reasoning_effort=args.reasoning_effort,
-                max_output_tokens=args.max_output_tokens,
-                prompt=prompt,
-                tex_upload=tex_upload,
-                bib_upload=bib_upload,
-                mcp_label=args.mcp_label,
-                mcp_url=args.mcp_url,
-                requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
-                mcp_headers=mcp_headers,
-            )
+        response, response_data, available_tool_names, thinking_note = provider_runtime.module.run_response(
+            client=client,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            max_output_tokens=args.max_output_tokens,
+            prompt=prompt,
+            tex_upload=tex_upload,
+            bib_upload=bib_upload,
+            mcp_label=args.mcp_label,
+            mcp_url=args.mcp_url,
+            requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+            mcp_headers=mcp_headers,
         )
         if thinking_note:
             print(thinking_note, file=sys.stderr)

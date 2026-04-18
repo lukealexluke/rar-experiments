@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 from contextlib import nullcontext
 import json
 import os
@@ -422,7 +421,7 @@ def build_thinking_config(model: str, reasoning_effort: str):
     return types.ThinkingConfig(thinking_budget=budget_map[reasoning_effort]), note
 
 
-async def run_response(
+def run_response(
     client,
     model: str,
     reasoning_effort: str,
@@ -462,6 +461,7 @@ async def run_response(
         ],
         tool_config=types.ToolConfig(
             function_calling_config=types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.ANY,
                 allowed_function_names=requested_tools,
             )
         ),
@@ -469,7 +469,7 @@ async def run_response(
             maximum_remote_calls=DEFAULT_APPROVAL_LIMIT,
         ),
     )
-    response = await client.aio.models.generate_content(
+    response = client.models.generate_content(
         model=model,
         contents=[prompt, tex_upload, bib_upload],
         config=config,
@@ -705,27 +705,24 @@ def main() -> int:
                     else nullcontext(None)
                 )
                 with generation_context as generation_observation:
-                    response, response_data, available_tool_names, thinking_note = asyncio.run(
-                        run_response(
-                            client=client,
-                            model=args.model,
-                            reasoning_effort=args.reasoning_effort,
-                            max_output_tokens=args.max_output_tokens,
-                            prompt=build_user_prompt(
-                                tex_path=upload_inputs.tex_path,
-                                bib_path=upload_inputs.bib_path,
-                                user_prompt=args.prompt,
-                                context_note=upload_inputs.prompt_note,
-                            ),
-                            tex_upload=tex_upload,
-                            bib_upload=bib_upload,
-                            mcp_label=args.mcp_label,
-                            mcp_url=args.mcp_url,
-                            requested_tools=mcp_tools,
-                            mcp_headers=mcp_headers,
-                        )
+                    response, response_data, available_tool_names, thinking_note = run_response(
+                        client=client,
+                        model=args.model,
+                        reasoning_effort=args.reasoning_effort,
+                        max_output_tokens=args.max_output_tokens,
+                        prompt=build_user_prompt(
+                            tex_path=upload_inputs.tex_path,
+                            bib_path=upload_inputs.bib_path,
+                            user_prompt=args.prompt,
+                            context_note=upload_inputs.prompt_note,
+                        ),
+                        tex_upload=tex_upload,
+                        bib_upload=bib_upload,
+                        mcp_label=args.mcp_label,
+                        mcp_url=args.mcp_url,
+                        requested_tools=mcp_tools,
+                        mcp_headers=mcp_headers,
                     )
-
                     if thinking_note:
                         print(thinking_note, file=sys.stderr)
                     print(
