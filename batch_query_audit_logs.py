@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import json
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import query_gemini_tex_mcp as gemini_query
@@ -68,6 +68,15 @@ PROVIDER_RUNTIMES: dict[str, ProviderRuntime] = {
 }
 
 
+@dataclass(frozen=True)
+class RetryManifest:
+    source_path: Path
+    failed_only: bool
+    selected_count: int
+    by_path: dict[tuple[str, int], dict[str, Any]]
+    by_name: dict[tuple[str, int], dict[str, Any]]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -103,6 +112,23 @@ def parse_args() -> argparse.Namespace:
         "--output-log",
         type=Path,
         help="Output JSONL log path. Defaults to a provider-specific file under <logs-dir>.",
+    )
+    parser.add_argument(
+        "--retry-from",
+        type=Path,
+        help=(
+            "Existing JSONL results log to use as a retry manifest. When provided, "
+            "only items present in that file are eligible to run."
+        ),
+    )
+    parser.add_argument(
+        "--retry-failed-only",
+        action="store_true",
+        help=(
+            "Retry only items whose previous status was not ok. When --retry-from is "
+            "omitted, the script uses the provider's default output log under "
+            "<logs-dir> as the retry source."
+        ),
     )
     parser.add_argument(
         "--raw-response-dir",
@@ -226,6 +252,18 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_provider_runtime(provider_name: str) -> ProviderRuntime:
     return PROVIDER_RUNTIMES[provider_name]
+
+
+def build_retry_output_log_name(default_output_log_name: str, failed_only: bool) -> str:
+    path = Path(default_output_log_name)
+    suffix = "_retry_failed" if failed_only else "_retry"
+    extension = path.suffix or ".jsonl"
+    return f"{path.stem}{suffix}{extension}"
+
+
+def build_retry_raw_response_dir_name(default_raw_response_dir_name: str, failed_only: bool) -> str:
+    suffix = "_retry_failed" if failed_only else "_retry"
+    return f"{default_raw_response_dir_name}{suffix}"
 
 
 def apply_provider_defaults(
@@ -354,6 +392,140 @@ def normalize_optional_string(value: object) -> str:
     if not cleaned or cleaned.lower() in {"null", "none", "unknown"}:
         return ""
     return cleaned
+
+
+def coerce_optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_retry_path_key(value: object) -> str:
+    text = normalize_optional_string(value)
+    if not text:
+        return ""
+    normalized = text.replace("\\", "/")
+    return normalized.lower()
+
+
+def normalize_retry_name_key(value: object) -> str:
+    text = normalize_optional_string(value)
+    if not text:
+        return ""
+    candidates = (
+        text.replace("\\", "/").rsplit("/", 1)[-1],
+        PurePosixPath(text).name,
+        PureWindowsPath(text).name,
+    )
+    for candidate in candidates:
+        normalized = candidate.strip().lower()
+        if normalized:
+            return normalized
+    return ""
+
+
+def load_retry_manifest(
+    source_path: Path,
+    *,
+    provider_name: str,
+    failed_only: bool,
+) -> RetryManifest:
+    resolved_source = source_path.resolve()
+    if not resolved_source.exists():
+        raise RuntimeError(f"retry manifest does not exist: {resolved_source}")
+    if not resolved_source.is_file():
+        raise RuntimeError(f"retry manifest is not a file: {resolved_source}")
+
+    by_path: dict[tuple[str, int], dict[str, Any]] = {}
+    by_name: dict[tuple[str, int], dict[str, Any]] = {}
+    selected_keys: set[tuple[str, int]] = set()
+
+    with resolved_source.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"retry manifest {resolved_source} contains invalid JSON on line "
+                    f"{line_number}: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise RuntimeError(
+                    f"retry manifest {resolved_source} contains a non-object JSON value "
+                    f"on line {line_number}."
+                )
+
+            row_provider = normalize_optional_string(row.get("provider")).lower()
+            if row_provider and row_provider != provider_name:
+                continue
+
+            record_index = coerce_optional_int(row.get("record_index"))
+            if record_index is None:
+                continue
+
+            previous_status = normalize_optional_string(row.get("status")).lower()
+            if failed_only and previous_status == "ok":
+                continue
+
+            path_key = normalize_retry_path_key(row.get("log_file"))
+            name_key = normalize_retry_name_key(row.get("log_file"))
+            if not path_key and not name_key:
+                continue
+
+            if path_key:
+                by_path[(path_key, record_index)] = row
+                selected_keys.add((path_key, record_index))
+            elif name_key:
+                selected_keys.add((f"name:{name_key}", record_index))
+
+            if name_key:
+                by_name[(name_key, record_index)] = row
+
+    return RetryManifest(
+        source_path=resolved_source,
+        failed_only=failed_only,
+        selected_count=len(selected_keys),
+        by_path=by_path,
+        by_name=by_name,
+    )
+
+
+def resolve_retry_manifest_path(
+    args: argparse.Namespace,
+    logs_dir: Path,
+    provider_runtime: ProviderRuntime,
+) -> Path | None:
+    if args.retry_from is not None:
+        return args.retry_from
+    if args.retry_failed_only:
+        return logs_dir / provider_runtime.default_output_log_name
+    return None
+
+
+def lookup_retry_manifest_row(
+    retry_manifest: RetryManifest,
+    log_path: Path,
+    record_index: int,
+) -> dict[str, Any] | None:
+    path_key = normalize_retry_path_key(str(log_path.resolve()))
+    if path_key:
+        row = retry_manifest.by_path.get((path_key, record_index))
+        if row is not None:
+            return row
+
+    name_key = normalize_retry_name_key(log_path.name)
+    if name_key:
+        row = retry_manifest.by_name.get((name_key, record_index))
+        if row is not None:
+            return row
+
+    return None
 
 
 def format_exception_message(exc: BaseException) -> str:
@@ -611,11 +783,37 @@ def main() -> int:
     if args.max_items is not None and args.max_items <= 0:
         print("Error: max-items must be positive when provided.", file=sys.stderr)
         return 1
+    if args.retry_failed_only and args.retry_from is not None and not args.retry_from.exists():
+        print(f"Error: retry manifest does not exist: {args.retry_from.resolve()}", file=sys.stderr)
+        return 1
 
     search_root = (args.search_root or logs_dir.parent).resolve()
-    output_log = (
-        args.output_log or (logs_dir / provider_runtime.default_output_log_name)
-    ).resolve()
+    retry_manifest_path = resolve_retry_manifest_path(args, logs_dir, provider_runtime)
+    retry_manifest: RetryManifest | None = None
+    if retry_manifest_path is not None:
+        try:
+            retry_manifest = load_retry_manifest(
+                retry_manifest_path,
+                provider_name=provider_runtime.name,
+                failed_only=args.retry_failed_only,
+            )
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+    default_output_log = logs_dir / provider_runtime.default_output_log_name
+    if args.output_log is not None:
+        output_log = args.output_log.resolve()
+    elif retry_manifest is not None:
+        output_log = (
+            logs_dir
+            / build_retry_output_log_name(
+                provider_runtime.default_output_log_name,
+                failed_only=args.retry_failed_only,
+            )
+        ).resolve()
+    else:
+        output_log = default_output_log.resolve()
     if output_log.exists() and not args.overwrite:
         print(
             f"Error: output log already exists: {output_log}. Use --overwrite to replace it.",
@@ -624,7 +822,17 @@ def main() -> int:
         return 1
     raw_response_dir = (
         args.raw_response_dir
-        or (output_log.parent / provider_runtime.default_raw_response_dir_name)
+        or (
+            output_log.parent
+            / (
+                build_retry_raw_response_dir_name(
+                    provider_runtime.default_raw_response_dir_name,
+                    failed_only=args.retry_failed_only,
+                )
+                if retry_manifest is not None
+                else provider_runtime.default_raw_response_dir_name
+            )
+        )
     ).resolve()
 
     try:
@@ -646,6 +854,13 @@ def main() -> int:
         print(f"Loaded environment from {dotenv_path}", file=sys.stderr)
     if langfuse_runtime.status_message:
         print(langfuse_runtime.status_message, file=sys.stderr)
+    if retry_manifest is not None:
+        retry_scope = "failed" if retry_manifest.failed_only else "previously logged"
+        print(
+            f"Loaded retry manifest from {retry_manifest.source_path} with "
+            f"{retry_manifest.selected_count} {retry_scope} item(s).",
+            file=sys.stderr,
+        )
 
     mcp_tools = args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS)
     log_paths = sorted_log_paths(logs_dir)
@@ -677,12 +892,31 @@ def main() -> int:
                     print(f"Skipping {log_path.name}: no audit records found.", file=sys.stderr)
                     continue
 
+                records_to_process = audit_context.records
+                if retry_manifest is not None:
+                    records_to_process = [
+                        record
+                        for record in audit_context.records
+                        if lookup_retry_manifest_row(
+                            retry_manifest,
+                            log_path=log_path,
+                            record_index=record.record_index,
+                        )
+                        is not None
+                    ]
+                    if not records_to_process:
+                        print(
+                            f"Skipping {log_path.name}: no retry-selected items.",
+                            file=sys.stderr,
+                        )
+                        continue
+
                 print(
-                    f"Processing {log_path.name} with {len(audit_context.records)} item(s)...",
+                    f"Processing {log_path.name} with {len(records_to_process)} item(s)...",
                     file=sys.stderr,
                 )
 
-                for record in audit_context.records:
+                for record in records_to_process:
                     if args.max_items is not None and processed_items >= args.max_items:
                         break
 
