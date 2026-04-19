@@ -840,9 +840,6 @@ def main() -> int:
     if args.max_items is not None and args.max_items <= 0:
         print("Error: max-items must be positive when provided.", file=sys.stderr)
         return 1
-    if args.retry_failed_only and args.retry_from is not None and not args.retry_from.exists():
-        print(f"Error: retry manifest does not exist: {args.retry_from.resolve()}", file=sys.stderr)
-        return 1
 
     search_root = (args.search_root or logs_dir.parent).resolve()
     retry_manifest_path = resolve_retry_manifest_path(args, logs_dir, provider_runtime)
