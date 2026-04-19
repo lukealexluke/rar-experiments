@@ -77,6 +77,13 @@ class RetryManifest:
     by_name: dict[tuple[str, int], dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class MergeOutcome:
+    rows: list[dict[str, Any]]
+    replaced_count: int
+    appended_count: int
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -241,6 +248,15 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Overwrite the output JSONL if it already exists.",
+    )
+    parser.add_argument(
+        "--update-existing-log",
+        action="store_true",
+        help=(
+            "Update an existing JSONL results log in place by replacing rows that match "
+            "the current run's results. This is intended for retry runs and preserves "
+            "untouched rows instead of replacing the whole file."
+        ),
     )
     parser.add_argument(
         "--max-items",
@@ -564,6 +580,108 @@ def recover_retry_manifest_path(path: Path, logs_dir: Path) -> Path:
     return path
 
 
+def load_result_log_rows(source_path: Path) -> list[dict[str, Any]]:
+    resolved_source = source_path.resolve()
+    if not resolved_source.exists():
+        raise RuntimeError(f"results log does not exist: {resolved_source}")
+    if not resolved_source.is_file():
+        raise RuntimeError(f"results log is not a file: {resolved_source}")
+
+    rows: list[dict[str, Any]] = []
+    with resolved_source.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"results log {resolved_source} contains invalid JSON on line "
+                    f"{line_number}: {exc}"
+                ) from exc
+            if not isinstance(row, dict):
+                raise RuntimeError(
+                    f"results log {resolved_source} contains a non-object JSON value "
+                    f"on line {line_number}."
+                )
+            rows.append(row)
+    return rows
+
+
+def build_result_row_match_keys(
+    row: dict[str, Any],
+    *,
+    default_provider: str | None = None,
+) -> list[tuple[str, str, int]]:
+    provider = normalize_optional_string(row.get("provider")).lower() or (default_provider or "")
+    if not provider:
+        return []
+
+    record_index = coerce_optional_int(row.get("record_index"))
+    if record_index is None:
+        return []
+
+    keys: list[tuple[str, str, int]] = []
+    path_key = normalize_retry_path_key(row.get("log_file"))
+    if path_key:
+        keys.append((provider, f"path:{path_key}", record_index))
+
+    name_key = normalize_retry_name_key(row.get("log_file"))
+    if name_key:
+        keys.append((provider, f"name:{name_key}", record_index))
+
+    return keys
+
+
+def merge_result_log_rows(
+    existing_rows: list[dict[str, Any]],
+    updated_rows: list[dict[str, Any]],
+    *,
+    default_provider: str,
+) -> MergeOutcome:
+    updated_rows_by_key: dict[tuple[str, str, int], dict[str, Any]] = {}
+    ordered_updated_rows: list[dict[str, Any]] = []
+
+    for row in updated_rows:
+        ordered_updated_rows.append(row)
+        for key in build_result_row_match_keys(row, default_provider=default_provider):
+            updated_rows_by_key[key] = row
+
+    merged_rows: list[dict[str, Any]] = []
+    consumed_update_ids: set[int] = set()
+    replaced_count = 0
+
+    for row in existing_rows:
+        replacement: dict[str, Any] | None = None
+        for key in build_result_row_match_keys(row, default_provider=default_provider):
+            candidate = updated_rows_by_key.get(key)
+            if candidate is not None:
+                replacement = candidate
+                break
+
+        if replacement is not None and id(replacement) not in consumed_update_ids:
+            merged_rows.append(replacement)
+            consumed_update_ids.add(id(replacement))
+            replaced_count += 1
+        else:
+            merged_rows.append(row)
+
+    appended_count = 0
+    for row in ordered_updated_rows:
+        if id(row) in consumed_update_ids:
+            continue
+        merged_rows.append(row)
+        consumed_update_ids.add(id(row))
+        appended_count += 1
+
+    return MergeOutcome(
+        rows=merged_rows,
+        replaced_count=replaced_count,
+        appended_count=appended_count,
+    )
+
+
 def lookup_retry_manifest_row(
     retry_manifest: RetryManifest,
     log_path: Path,
@@ -862,10 +980,18 @@ def main() -> int:
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+    if args.update_existing_log and retry_manifest is None:
+        print(
+            "Error: --update-existing-log requires --retry-from or --retry-failed-only.",
+            file=sys.stderr,
+        )
+        return 1
 
     default_output_log = logs_dir / provider_runtime.default_output_log_name
     if args.output_log is not None:
         output_log = args.output_log.resolve()
+    elif args.update_existing_log and retry_manifest is not None:
+        output_log = retry_manifest.source_path.resolve()
     elif retry_manifest is not None:
         output_log = (
             logs_dir
@@ -876,7 +1002,13 @@ def main() -> int:
         ).resolve()
     else:
         output_log = default_output_log.resolve()
-    if output_log.exists() and not args.overwrite:
+    if args.update_existing_log and not output_log.exists():
+        print(
+            f"Error: output log to update does not exist: {output_log}",
+            file=sys.stderr,
+        )
+        return 1
+    if not args.update_existing_log and output_log.exists() and not args.overwrite:
         print(
             f"Error: output log already exists: {output_log}. Use --overwrite to replace it.",
             file=sys.stderr,
@@ -933,8 +1065,13 @@ def main() -> int:
     output_log.parent.mkdir(parents=True, exist_ok=True)
     raw_response_dir.mkdir(parents=True, exist_ok=True)
     processed_items = 0
+    pending_update_rows: list[dict[str, Any]] | None = [] if args.update_existing_log else None
     try:
-        with output_log.open("w", encoding="utf-8") as handle:
+        with (
+            nullcontext(None)
+            if args.update_existing_log
+            else output_log.open("w", encoding="utf-8")
+        ) as handle:
             for log_path in log_paths:
                 if args.max_items is not None and processed_items >= args.max_items:
                     break
@@ -1219,9 +1356,28 @@ def main() -> int:
                                 uploaded_file_refs,
                             )
 
-                    handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-                    handle.flush()
+                    if pending_update_rows is not None:
+                        pending_update_rows.append(dict(result))
+                    else:
+                        handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        handle.flush()
                     processed_items += 1
+
+        if pending_update_rows is not None:
+            try:
+                existing_rows = load_result_log_rows(output_log)
+            except RuntimeError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+
+            merge_outcome = merge_result_log_rows(
+                existing_rows,
+                pending_update_rows,
+                default_provider=provider_runtime.name,
+            )
+            with output_log.open("w", encoding="utf-8") as handle:
+                for row in merge_outcome.rows:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     finally:
         if "langfuse_runtime" in locals() and langfuse_runtime.enabled:
             flush_langfuse(langfuse_runtime)
@@ -1231,7 +1387,14 @@ def main() -> int:
             except Exception:
                 pass
 
-    print(f"Wrote {processed_items} {provider_runtime.label} result(s) to {output_log}")
+    if pending_update_rows is not None:
+        print(
+            f"Updated {output_log} with {processed_items} {provider_runtime.label} retry "
+            f"result(s) ({merge_outcome.replaced_count} replaced, "
+            f"{merge_outcome.appended_count} appended)."
+        )
+    else:
+        print(f"Wrote {processed_items} {provider_runtime.label} result(s) to {output_log}")
     return 0
 
 
