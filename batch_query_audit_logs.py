@@ -254,6 +254,32 @@ def resolve_provider_runtime(provider_name: str) -> ProviderRuntime:
     return PROVIDER_RUNTIMES[provider_name]
 
 
+def normalize_cli_path(path: Path | None) -> Path | None:
+    if path is None or sys.platform.startswith("win"):
+        return path
+
+    rendered = str(path)
+    if "\\" not in rendered:
+        return path
+
+    normalized = rendered.replace("\\", "/")
+    if normalized.startswith("./") or normalized.startswith("../") or normalized.startswith("/"):
+        return Path(normalized)
+    if normalized.startswith("."):
+        return Path(normalized)
+    return Path(normalized)
+
+
+def normalize_cli_path_args(args: argparse.Namespace) -> argparse.Namespace:
+    for field_name in ("logs_dir", "search_root", "output_log", "retry_from", "raw_response_dir"):
+        setattr(args, field_name, normalize_cli_path(getattr(args, field_name, None)))
+    return args
+
+
+def compact_path_string(value: str) -> str:
+    return value.replace("\\", "").replace("/", "").strip().lower()
+
+
 def build_retry_output_log_name(default_output_log_name: str, failed_only: bool) -> str:
     path = Path(default_output_log_name)
     suffix = "_retry_failed" if failed_only else "_retry"
@@ -506,6 +532,36 @@ def resolve_retry_manifest_path(
     if args.retry_failed_only:
         return logs_dir / provider_runtime.default_output_log_name
     return None
+
+
+def recover_retry_manifest_path(path: Path, logs_dir: Path) -> Path:
+    if path.exists() or sys.platform.startswith("win"):
+        return path
+
+    rendered = normalize_optional_string(str(path))
+    if not rendered or "/" in rendered or "\\" in rendered or not rendered.endswith(".jsonl"):
+        return path
+
+    search_root = logs_dir.parent.resolve()
+    target = compact_path_string(rendered)
+    matches: list[Path] = []
+
+    for candidate in search_root.rglob("*.jsonl"):
+        resolved_candidate = candidate.resolve()
+        candidate_variants = [resolved_candidate.name, str(resolved_candidate)]
+        try:
+            relative_candidate = resolved_candidate.relative_to(search_root)
+            candidate_variants.append(str(relative_candidate))
+            candidate_variants.append(f".{Path(relative_candidate).as_posix()}")
+        except ValueError:
+            pass
+
+        if any(compact_path_string(variant) == target for variant in candidate_variants):
+            matches.append(resolved_candidate)
+
+    if len(matches) == 1:
+        return matches[0]
+    return path
 
 
 def lookup_retry_manifest_row(
@@ -772,6 +828,7 @@ def run_provider_response(
 
 def main() -> int:
     args = parse_args()
+    args = normalize_cli_path_args(args)
     provider_runtime = resolve_provider_runtime(args.provider)
     args = apply_provider_defaults(args, provider_runtime)
 
@@ -791,6 +848,14 @@ def main() -> int:
     retry_manifest_path = resolve_retry_manifest_path(args, logs_dir, provider_runtime)
     retry_manifest: RetryManifest | None = None
     if retry_manifest_path is not None:
+        recovered_retry_manifest_path = recover_retry_manifest_path(retry_manifest_path, logs_dir)
+        if recovered_retry_manifest_path != retry_manifest_path:
+            print(
+                f"Recovered retry manifest path {retry_manifest_path} -> "
+                f"{recovered_retry_manifest_path}",
+                file=sys.stderr,
+            )
+            retry_manifest_path = recovered_retry_manifest_path
         try:
             retry_manifest = load_retry_manifest(
                 retry_manifest_path,
