@@ -52,7 +52,7 @@ from statement_reference_audit import read_candidate_text
 
 
 DEFAULT_API_KEY_ENV = ""
-DEFAULT_MODEL = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_AWS_REGION = "us-east-1"
 DEFAULT_CLAUDE_INPUT_COST_ENV = "CLAUDE_BEDROCK_INPUT_COST_PER_1M"
@@ -135,7 +135,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help=f"Bedrock model ID to use. Defaults to {DEFAULT_MODEL}.",
+        help=(
+            "Bedrock model or inference profile ID to use. Claude Sonnet 4.5 "
+            f"requires an inference profile for on-demand use. Defaults to {DEFAULT_MODEL}."
+        ),
     )
     parser.add_argument(
         "--reasoning-effort",
