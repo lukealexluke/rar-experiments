@@ -6,42 +6,72 @@ import csv
 import json
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 from statement_reference_audit_wholebody import normalize_arxiv_id
 
 
-LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+Line:\s+(\d+)$")
 DEFAULT_LOGS_DIR = Path("statement_reference_audit_logs")
 FALLBACK_LOGS_DIRS = (
     Path("random_arxiv_source_samples") / "statement_reference_audit_logs",
 )
-
-
-@dataclass(frozen=True)
-class GoldRecord:
-    record_index: int
-    line_number: int
-    name: str
-    ext_source: str
-    line_text: str
+RESULT_CSV_FIELDS = ("baseline_id", "baseline_num", "ai_id", "ai_num")
+ARXIV_VERSION_SUFFIX_RE = re.compile(r"v\d+$", re.IGNORECASE)
+STATEMENT_PREFIX_RE = re.compile(
+    r"^(theorems?|thms?\.?|thm\.?|lemmas?|lems?\.?|lem\.?|"
+    r"corollaries|cors?\.?|cor\.?|propositions?|props?\.?|prop\.?|"
+    r"claims?|conjectures?|definitions?|defs?\.?|defn\.?)\s*(.+)$",
+    re.IGNORECASE,
+)
+CANONICAL_STATEMENT_PREFIXES = {
+    "theorem": "theorem",
+    "theorems": "theorem",
+    "thm": "theorem",
+    "thms": "theorem",
+    "lemma": "lemma",
+    "lemmas": "lemma",
+    "lem": "lemma",
+    "lems": "lemma",
+    "corollary": "corollary",
+    "corollaries": "corollary",
+    "cor": "corollary",
+    "cors": "corollary",
+    "proposition": "proposition",
+    "propositions": "proposition",
+    "prop": "proposition",
+    "props": "proposition",
+    "claim": "claim",
+    "claims": "claim",
+    "conjecture": "conjecture",
+    "conjectures": "conjecture",
+    "definition": "definition",
+    "definitions": "definition",
+    "def": "definition",
+    "defs": "definition",
+    "defn": "definition",
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate batch_query_audit_logs JSONL output against the ground-truth "
-            "Name and External Source fields stored in the audit logs."
+            "Evaluate batch_query_audit_logs CSV output using baseline_id/baseline_num "
+            "and ai_id/ai_num columns."
         )
+    )
+    parser.add_argument(
+        "--results-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the CSV results file. Defaults to <logs-dir>/openai_query_results.csv."
+        ),
     )
     parser.add_argument(
         "--results-jsonl",
         type=Path,
         default=None,
-        help=(
-            "Path to the JSONL results file. Defaults to <logs-dir>/openai_query_results.jsonl."
-        ),
+        help="Deprecated alias for --results-csv.",
     )
     parser.add_argument(
         "--logs-dir",
@@ -79,47 +109,15 @@ def resolve_logs_dir(requested_logs_dir: Path) -> Path:
     raise RuntimeError(f"logs directory does not exist. Tried: {rendered}")
 
 
-def resolve_results_jsonl(results_jsonl: Path | None, logs_dir: Path) -> Path:
-    if results_jsonl is not None:
-        resolved = results_jsonl.resolve()
+def resolve_results_csv(results_csv: Path | None, results_jsonl: Path | None, logs_dir: Path) -> Path:
+    requested_results = results_csv or results_jsonl
+    if requested_results is not None:
+        resolved = requested_results.resolve()
     else:
-        resolved = (logs_dir / "openai_query_results.jsonl").resolve()
+        resolved = (logs_dir / "openai_query_results.csv").resolve()
     if not resolved.exists() or not resolved.is_file():
-        raise RuntimeError(f"results JSONL does not exist: {resolved}")
+        raise RuntimeError(f"results CSV does not exist: {resolved}")
     return resolved
-
-
-def parse_log_file(log_path: Path) -> dict[int, GoldRecord]:
-    lines = log_path.read_text(encoding="utf-8").splitlines()
-    records: dict[int, GoldRecord] = {}
-    index = 0
-    while index < len(lines):
-        match = LOG_ENTRY_RE.match(lines[index].strip())
-        if not match:
-            index += 1
-            continue
-
-        record_index = int(match.group(1))
-        line_number = int(match.group(2))
-        cursor = index + 1
-        name = ""
-        ext_source = ""
-        if cursor < len(lines) and lines[cursor].startswith("Name: "):
-            name = lines[cursor][len("Name: ") :].strip()
-            cursor += 1
-        if cursor < len(lines) and lines[cursor].startswith("External Source: "):
-            ext_source = lines[cursor][len("External Source: ") :].strip()
-            cursor += 1
-        line_text = lines[cursor].rstrip() if cursor < len(lines) else ""
-        records[record_index] = GoldRecord(
-            record_index=record_index,
-            line_number=line_number,
-            name=name,
-            ext_source=normalize_ext_source(ext_source),
-            line_text=line_text,
-        )
-        index = cursor + 1
-    return records
 
 
 def normalize_text(value: object) -> str:
@@ -138,46 +136,33 @@ def normalize_statement_name(value: object) -> str:
     if not text:
         return ""
     text = text.replace("~", " ").replace("{", " ").replace("}", " ")
+    text = re.sub(r"\\[,;:! ]", " ", text)
     text = re.sub(r"[,:;]+$", "", text)
-    return re.sub(r"\s+", " ", text).strip().lower()
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    match = STATEMENT_PREFIX_RE.match(text)
+    if not match:
+        return text
+
+    raw_prefix = match.group(1).rstrip(".").lower()
+    canonical_prefix = CANONICAL_STATEMENT_PREFIXES.get(raw_prefix, raw_prefix)
+    return f"{canonical_prefix} {match.group(2).strip()}"
 
 
 def normalize_ext_source(value: object) -> str:
     text = normalize_text(value)
-    return normalize_arxiv_id(text) if text else ""
+    return ARXIV_VERSION_SUFFIX_RE.sub("", normalize_arxiv_id(text)) if text else ""
 
 
-def load_jsonl(path: Path) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                row = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(f"Invalid JSON on line {line_number} of {path}: {exc}") from exc
-            if not isinstance(row, dict):
-                raise RuntimeError(f"Expected JSON object on line {line_number} of {path}")
-            rows.append(row)
+def load_result_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing_fields = [field for field in RESULT_CSV_FIELDS if field not in (reader.fieldnames or [])]
+        if missing_fields:
+            raise RuntimeError(
+                f"results CSV is missing required column(s): {', '.join(missing_fields)}"
+            )
+        rows = [dict(row) for row in reader]
     return rows
-
-
-def resolve_log_path(raw_log_file: object, logs_dir: Path) -> Path:
-    log_file = normalize_text(raw_log_file)
-    if not log_file:
-        raise RuntimeError("Result row is missing log_file")
-
-    direct_path = Path(log_file)
-    if direct_path.exists():
-        return direct_path.resolve()
-
-    by_name = (logs_dir / direct_path.name).resolve()
-    if by_name.exists():
-        return by_name
-
-    raise RuntimeError(f"Could not resolve log file from results row: {log_file}")
 
 
 def safe_ratio(numerator: int, denominator: int) -> float | None:
@@ -191,154 +176,95 @@ def main() -> int:
 
     try:
         logs_dir = resolve_logs_dir(args.logs_dir)
-        results_jsonl = resolve_results_jsonl(args.results_jsonl, logs_dir)
-        rows = load_jsonl(results_jsonl)
+        results_csv = resolve_results_csv(args.results_csv, args.results_jsonl, logs_dir)
+        rows = load_result_csv(results_csv)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     if not rows:
-        print(f"Error: no rows found in {results_jsonl}", file=sys.stderr)
+        print(f"Error: no rows found in {results_csv}", file=sys.stderr)
         return 1
 
-    gold_cache: dict[Path, dict[int, GoldRecord]] = {}
     detail_rows: list[dict[str, object]] = []
 
     total_items = 0
-    completed_items = 0
-    incomplete_items = 0
-    error_items = 0
-    name_gold_items = 0
-    ext_gold_items = 0
+    num_gold_items = 0
+    id_gold_items = 0
     both_gold_items = 0
-    name_match_items = 0
-    ext_match_items = 0
+    num_match_items = 0
+    id_match_items = 0
     both_match_items = 0
 
     for row in rows:
         total_items += 1
-        response_status = normalize_text(row.get("response_status"))
-        status = normalize_text(row.get("status"))
-        if response_status == "completed":
-            completed_items += 1
-        elif response_status:
-            incomplete_items += 1
-        if normalize_text(row.get("error")):
-            error_items += 1
+        baseline_num = normalize_text(row.get("baseline_num"))
+        baseline_id = normalize_ext_source(row.get("baseline_id"))
+        ai_num = normalize_text(row.get("ai_num"))
+        ai_id = normalize_ext_source(row.get("ai_id"))
 
-        try:
-            log_path = resolve_log_path(row.get("log_file"), logs_dir)
-            if log_path not in gold_cache:
-                gold_cache[log_path] = parse_log_file(log_path)
-            record_index = int(row.get("record_index"))
-            gold_record = gold_cache[log_path].get(record_index)
-            if gold_record is None:
-                raise RuntimeError(
-                    f"No matching record [{record_index}] in {log_path.name}"
-                )
-        except Exception as exc:
-            detail_rows.append(
-                {
-                    "log_file": normalize_text(row.get("log_file")),
-                    "record_index": row.get("record_index"),
-                    "line_number": row.get("line_number"),
-                    "status": status,
-                    "response_status": response_status,
-                    "gold_name": "",
-                    "gold_ext_source": "",
-                    "gpt_name": normalize_text(row.get("gpt_name")),
-                    "gpt_ext_source": normalize_ext_source(row.get("gpt_ext_source")),
-                    "name_match": "",
-                    "ext_source_match": "",
-                    "both_match": "",
-                    "error": str(exc),
-                }
-            )
-            continue
+        baseline_num_norm = normalize_statement_name(baseline_num)
+        baseline_id_norm = normalize_ext_source(baseline_id)
+        ai_num_norm = normalize_statement_name(ai_num)
+        ai_id_norm = normalize_ext_source(ai_id)
 
-        gold_name = gold_record.name
-        gold_ext_source = gold_record.ext_source
-        gpt_name = normalize_text(row.get("gpt_name"))
-        gpt_ext_source = normalize_ext_source(row.get("gpt_ext_source"))
+        num_match = bool(baseline_num_norm) and baseline_num_norm == ai_num_norm
+        id_match = bool(baseline_id_norm) and baseline_id_norm == ai_id_norm
+        both_match = num_match and id_match
 
-        gold_name_norm = normalize_statement_name(gold_name)
-        gold_ext_norm = normalize_ext_source(gold_ext_source)
-        gpt_name_norm = normalize_statement_name(gpt_name)
-        gpt_ext_norm = normalize_ext_source(gpt_ext_source)
-
-        name_match = bool(gold_name_norm) and gold_name_norm == gpt_name_norm
-        ext_match = bool(gold_ext_norm) and gold_ext_norm == gpt_ext_norm
-        both_match = name_match and ext_match
-
-        if gold_name_norm:
-            name_gold_items += 1
-            if name_match:
-                name_match_items += 1
-        if gold_ext_norm:
-            ext_gold_items += 1
-            if ext_match:
-                ext_match_items += 1
-        if gold_name_norm and gold_ext_norm:
+        if baseline_num_norm:
+            num_gold_items += 1
+            if num_match:
+                num_match_items += 1
+        if baseline_id_norm:
+            id_gold_items += 1
+            if id_match:
+                id_match_items += 1
+        if baseline_num_norm and baseline_id_norm:
             both_gold_items += 1
             if both_match:
                 both_match_items += 1
 
         detail_rows.append(
             {
-                "log_file": str(log_path),
-                "record_index": gold_record.record_index,
-                "line_number": gold_record.line_number,
-                "status": status,
-                "response_status": response_status,
-                "gold_name": gold_name,
-                "gold_ext_source": gold_ext_source,
-                "gpt_name": gpt_name,
-                "gpt_ext_source": gpt_ext_source,
-                "name_match": name_match,
-                "ext_source_match": ext_match,
+                "baseline_id": baseline_id,
+                "baseline_num": baseline_num,
+                "ai_id": ai_id,
+                "ai_num": ai_num,
+                "id_match": id_match,
+                "num_match": num_match,
                 "both_match": both_match,
-                "error": normalize_text(row.get("error")),
             }
         )
 
     summary = {
-        "results_jsonl": str(results_jsonl),
+        "results_csv": str(results_csv),
         "logs_dir": str(logs_dir),
         "total_items": total_items,
-        "completed_items": completed_items,
-        "incomplete_items": incomplete_items,
-        "error_items": error_items,
-        "name_gold_items": name_gold_items,
-        "ext_source_gold_items": ext_gold_items,
+        "baseline_num_items": num_gold_items,
+        "baseline_id_items": id_gold_items,
         "both_gold_items": both_gold_items,
-        "name_match_items": name_match_items,
-        "ext_source_match_items": ext_match_items,
+        "num_match_items": num_match_items,
+        "id_match_items": id_match_items,
         "both_match_items": both_match_items,
-        "completion_rate": safe_ratio(completed_items, total_items),
-        "name_accuracy": safe_ratio(name_match_items, name_gold_items),
-        "ext_source_accuracy": safe_ratio(ext_match_items, ext_gold_items),
+        "num_accuracy": safe_ratio(num_match_items, num_gold_items),
+        "id_accuracy": safe_ratio(id_match_items, id_gold_items),
         "both_accuracy": safe_ratio(both_match_items, both_gold_items),
     }
 
-    details_csv = args.details_csv or results_jsonl.with_name("openai_query_evaluation_details.csv")
+    details_csv = args.details_csv or results_csv.with_name("query_evaluation_details.csv")
     details_csv.parent.mkdir(parents=True, exist_ok=True)
     with details_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
-                "log_file",
-                "record_index",
-                "line_number",
-                "status",
-                "response_status",
-                "gold_name",
-                "gold_ext_source",
-                "gpt_name",
-                "gpt_ext_source",
-                "name_match",
-                "ext_source_match",
+                "baseline_id",
+                "baseline_num",
+                "ai_id",
+                "ai_num",
+                "id_match",
+                "num_match",
                 "both_match",
-                "error",
             ],
         )
         writer.writeheader()

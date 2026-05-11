@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from contextlib import nullcontext
 from dataclasses import dataclass
 import json
@@ -14,6 +15,7 @@ import query_gemini_tex_mcp as gemini_query
 import query_openai_tex_mcp as openai_query
 from query_openai_tex_mcp import (
     DEFAULT_ALLOWED_MCP_TOOLS,
+    DEFAULT_BODY_CONTEXT_LINES,
     DEFAULT_LANGFUSE_TRACE_NAME,
     DEFAULT_MCP_LABEL,
     DEFAULT_MCP_URL,
@@ -24,12 +26,15 @@ from query_openai_tex_mcp import (
     load_environment_from_dotenv,
     parse_audit_log,
     parse_mcp_headers,
+    parse_nonnegative_int,
     prepare_upload_inputs,
     read_api_key,
     setup_langfuse,
 )
+from statement_reference_audit_wholebody import normalize_arxiv_id
 
 CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+RESULT_CSV_FIELDS = ("baseline_id", "baseline_num", "ai_id", "ai_num")
 DEFAULT_LOGS_DIR = Path("statement_reference_audit_logs")
 FALLBACK_LOGS_DIRS = (
     Path("random_arxiv_source_samples") / "statement_reference_audit_logs",
@@ -54,7 +59,7 @@ PROVIDER_RUNTIMES: dict[str, ProviderRuntime] = {
         label="OpenAI",
         module=openai_query,
         generation_observation_name="openai.responses.create",
-        default_output_log_name="openai_query_results.jsonl",
+        default_output_log_name="openai_query_results.csv",
         default_raw_response_dir_name="raw_openai_responses",
     ),
     "gemini": ProviderRuntime(
@@ -62,7 +67,7 @@ PROVIDER_RUNTIMES: dict[str, ProviderRuntime] = {
         label="Gemini",
         module=gemini_query,
         generation_observation_name="google.genai.models.generate_content",
-        default_output_log_name="gemini_query_results.jsonl",
+        default_output_log_name="gemini_query_results.csv",
         default_raw_response_dir_name="raw_gemini_responses",
     ),
 }
@@ -88,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run theorem-citation queries over every audit-log entry in a "
-            "statement_reference_audit_logs directory and write one JSON result per line."
+            "statement_reference_audit_logs directory and write CSV results."
         )
     )
     parser.add_argument(
@@ -118,13 +123,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-log",
         type=Path,
-        help="Output JSONL log path. Defaults to a provider-specific file under <logs-dir>.",
+        help="Output CSV path. Defaults to a provider-specific file under <logs-dir>.",
     )
     parser.add_argument(
         "--retry-from",
         type=Path,
         help=(
-            "Existing JSONL results log to use as a retry manifest. When provided, "
+            "Existing detailed JSONL results log to use as a retry manifest. When provided, "
             "only items present in that file are eligible to run."
         ),
     )
@@ -132,9 +137,8 @@ def parse_args() -> argparse.Namespace:
         "--retry-failed-only",
         action="store_true",
         help=(
-            "Retry only items whose previous status was not ok. When --retry-from is "
-            "omitted, the script uses the provider's default output log under "
-            "<logs-dir> as the retry source."
+            "Retry only items whose previous detailed JSONL status was not ok. "
+            "Requires --retry-from."
         ),
     )
     parser.add_argument(
@@ -151,6 +155,19 @@ def parse_args() -> argparse.Namespace:
             "Optional custom task instruction appended after the audit-log context. "
             "If omitted, the script asks for the cited theorem-like result name/number "
             "and the external arXiv identifier."
+        ),
+    )
+    parser.add_argument(
+        "--tex-context-lines",
+        "--body-context-lines",
+        "--context-lines",
+        dest="body_context_lines",
+        type=parse_nonnegative_int,
+        default=DEFAULT_BODY_CONTEXT_LINES,
+        metavar="N",
+        help=(
+            "Number of main TeX body lines before and after each logged citation line to upload. "
+            f"Defaults to {DEFAULT_BODY_CONTEXT_LINES}."
         ),
     )
     parser.add_argument(
@@ -247,13 +264,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite the output JSONL if it already exists.",
+        help="Overwrite the output CSV if it already exists.",
     )
     parser.add_argument(
         "--update-existing-log",
         action="store_true",
         help=(
-            "Update an existing JSONL results log in place by replacing rows that match "
+            "Update an existing CSV results log in place by replacing rows that match "
             "the current run's results. This is intended for retry runs and preserves "
             "untouched rows instead of replacing the whole file."
         ),
@@ -299,7 +316,7 @@ def compact_path_string(value: str) -> str:
 def build_retry_output_log_name(default_output_log_name: str, failed_only: bool) -> str:
     path = Path(default_output_log_name)
     suffix = "_retry_failed" if failed_only else "_retry"
-    extension = path.suffix or ".jsonl"
+    extension = path.suffix or ".csv"
     return f"{path.stem}{suffix}{extension}"
 
 
@@ -380,14 +397,20 @@ def resolve_fallback_bib_path(logged_bib_paths: tuple[Path, ...], tex_path: Path
     raise RuntimeError(f"Could not find a bibliography file near {tex_path}")
 
 
-def build_item_prompt(log_name: str, record_index: int, line_number: int, user_prompt: str | None) -> str:
+def build_item_prompt(
+    log_name: str,
+    record_index: int,
+    line_number: int,
+    user_prompt: str | None,
+    body_context_lines: int,
+) -> str:
     default_instruction = (
         "Task:\n"
-        '1. Identify the cited theorem-like result name/number, for example "Theorem 1.2" or "Proposition 3.4".\n'
-        "2. Identify the external arXiv identifier of the cited source paper containing that result.\n"
+        "1. Identify the external arXiv identifier of the cited source paper containing the missing result.\n"
+        '2. Identify the cited theorem-like result name/number, for example "Theorem 1.2" or "Proposition 3.4".\n'
         "Use theorem_search if it helps.\n\n"
         "Return JSON only, with exactly this shape:\n"
-        '{"gpt_name": <string or null>, "gpt_ext_source": <string or null>}'
+        '{"ai_id": <string or null>, "ai_num": <string or null>}'
     )
     instruction = user_prompt.strip() if user_prompt else default_instruction
     return (
@@ -395,14 +418,16 @@ def build_item_prompt(log_name: str, record_index: int, line_number: int, user_p
         f"Log file: {log_name}\n"
         f"Log item: {record_index}\n"
         f"Logged source line number: {line_number}\n\n"
-        "The attached LaTeX source has been truncated at the logged line.\n"
+        "The attached LaTeX source is a main-body excerpt containing up to "
+        f"{body_context_lines} line(s) before and after the logged line.\n"
         "The relevant citation on that line has been masked as [Citation Needed].\n"
-        "The matching bibliography entry has been removed from the uploaded bibliography text.\n\n"
+        "The bibliography upload is not line-windowed; the matching bibliography entry "
+        "has been removed from the uploaded bibliography text when it could be identified.\n\n"
         f"{instruction}"
     )
 
 
-def parse_gpt_response(output_text: str) -> tuple[str, str]:
+def parse_ai_response(output_text: str) -> tuple[str, str]:
     text = output_text.strip()
     if not text:
         return "", ""
@@ -414,15 +439,34 @@ def parse_gpt_response(output_text: str) -> tuple[str, str]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return "", ""
+        start_index = text.find("{")
+        end_index = text.rfind("}")
+        if start_index < 0 or end_index <= start_index:
+            return "", ""
+        try:
+            data = json.loads(text[start_index : end_index + 1])
+        except json.JSONDecodeError:
+            return "", ""
     if not isinstance(data, dict):
         return "", ""
 
-    gpt_name = normalize_optional_string(data.get("gpt_name") or data.get("name"))
-    gpt_ext_source = normalize_optional_string(
-        data.get("gpt_ext_source") or data.get("ext_source")
+    ai_id = normalize_optional_string(
+        data.get("ai_id")
+        or data.get("arxiv_id")
+        or data.get("located_arxiv_id")
+        or data.get("gpt_ext_source")
+        or data.get("ext_source")
     )
-    return gpt_name, gpt_ext_source
+    ai_num = normalize_optional_string(
+        data.get("ai_num")
+        or data.get("theorem_name")
+        or data.get("theorem")
+        or data.get("result_name")
+        or data.get("located_theorem_name")
+        or data.get("gpt_name")
+        or data.get("name")
+    )
+    return ai_id, ai_num
 
 
 def normalize_optional_string(value: object) -> str:
@@ -434,6 +478,34 @@ def normalize_optional_string(value: object) -> str:
     if not cleaned or cleaned.lower() in {"null", "none", "unknown"}:
         return ""
     return cleaned
+
+
+def normalize_result_id(value: object) -> str:
+    text = normalize_optional_string(value)
+    return normalize_arxiv_id(text) if text else ""
+
+
+def baseline_fields_from_record(record: object) -> tuple[str, str]:
+    baseline_id = normalize_result_id(getattr(record, "baseline_id", ""))
+    baseline_num = normalize_optional_string(getattr(record, "baseline_num", ""))
+    return baseline_id, baseline_num
+
+
+def result_to_csv_row(result: dict[str, object]) -> dict[str, str]:
+    return {
+        "baseline_id": normalize_result_id(result.get("baseline_id")),
+        "baseline_num": normalize_optional_string(result.get("baseline_num")),
+        "ai_id": normalize_result_id(result.get("ai_id")),
+        "ai_num": normalize_optional_string(result.get("ai_num")),
+    }
+
+
+def write_result_csv_rows(output_path: Path, rows: list[dict[str, object]]) -> None:
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(RESULT_CSV_FIELDS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(result_to_csv_row(row))
 
 
 def coerce_optional_int(value: object) -> int | None:
@@ -545,8 +617,6 @@ def resolve_retry_manifest_path(
 ) -> Path | None:
     if args.retry_from is not None:
         return args.retry_from
-    if args.retry_failed_only:
-        return logs_dir / provider_runtime.default_output_log_name
     return None
 
 
@@ -587,6 +657,10 @@ def load_result_log_rows(source_path: Path) -> list[dict[str, Any]]:
     if not resolved_source.is_file():
         raise RuntimeError(f"results log is not a file: {resolved_source}")
 
+    if resolved_source.suffix.lower() == ".csv":
+        with resolved_source.open("r", encoding="utf-8", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+
     rows: list[dict[str, Any]] = []
     with resolved_source.open("r", encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
@@ -613,7 +687,12 @@ def build_result_row_match_keys(
     row: dict[str, Any],
     *,
     default_provider: str | None = None,
-) -> list[tuple[str, str, int]]:
+) -> list[tuple[str, str, str]]:
+    baseline_id = normalize_result_id(row.get("baseline_id"))
+    baseline_num = normalize_optional_string(row.get("baseline_num")).lower()
+    if baseline_id or baseline_num:
+        return [("baseline", baseline_id, baseline_num)]
+
     provider = normalize_optional_string(row.get("provider")).lower() or (default_provider or "")
     if not provider:
         return []
@@ -622,14 +701,14 @@ def build_result_row_match_keys(
     if record_index is None:
         return []
 
-    keys: list[tuple[str, str, int]] = []
+    keys: list[tuple[str, str, str]] = []
     path_key = normalize_retry_path_key(row.get("log_file"))
     if path_key:
-        keys.append((provider, f"path:{path_key}", record_index))
+        keys.append((provider, f"path:{path_key}", str(record_index)))
 
     name_key = normalize_retry_name_key(row.get("log_file"))
     if name_key:
-        keys.append((provider, f"name:{name_key}", record_index))
+        keys.append((provider, f"name:{name_key}", str(record_index)))
 
     return keys
 
@@ -640,7 +719,7 @@ def merge_result_log_rows(
     *,
     default_provider: str,
 ) -> MergeOutcome:
-    updated_rows_by_key: dict[tuple[str, str, int], dict[str, Any]] = {}
+    updated_rows_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     ordered_updated_rows: list[dict[str, Any]] = []
 
     for row in updated_rows:
@@ -729,6 +808,7 @@ def build_langfuse_batch_span_input(
     log_path: Path,
     record_index: int,
     line_number: int,
+    body_context_lines: int,
     tex_path: Path,
     prompt: str,
     model: str,
@@ -743,6 +823,7 @@ def build_langfuse_batch_span_input(
         "log_file": str(log_path),
         "record_index": record_index,
         "line_number": line_number,
+        "body_context_lines": body_context_lines,
         "tex_file": str(tex_path),
         "user_prompt": prompt,
         "model": model,
@@ -958,6 +1039,12 @@ def main() -> int:
     if args.max_items is not None and args.max_items <= 0:
         print("Error: max-items must be positive when provided.", file=sys.stderr)
         return 1
+    if args.retry_failed_only and args.retry_from is None:
+        print(
+            "Error: --retry-failed-only requires --retry-from with a detailed JSONL retry manifest.",
+            file=sys.stderr,
+        )
+        return 1
 
     search_root = (args.search_root or logs_dir.parent).resolve()
     retry_manifest_path = resolve_retry_manifest_path(args, logs_dir, provider_runtime)
@@ -990,8 +1077,8 @@ def main() -> int:
     default_output_log = logs_dir / provider_runtime.default_output_log_name
     if args.output_log is not None:
         output_log = args.output_log.resolve()
-    elif args.update_existing_log and retry_manifest is not None:
-        output_log = retry_manifest.source_path.resolve()
+    elif args.update_existing_log:
+        output_log = default_output_log.resolve()
     elif retry_manifest is not None:
         output_log = (
             logs_dir
@@ -1065,305 +1152,305 @@ def main() -> int:
     output_log.parent.mkdir(parents=True, exist_ok=True)
     raw_response_dir.mkdir(parents=True, exist_ok=True)
     processed_items = 0
-    pending_update_rows: list[dict[str, Any]] | None = [] if args.update_existing_log else None
+    result_rows: list[dict[str, Any]] = []
     try:
-        with (
-            nullcontext(None)
-            if args.update_existing_log
-            else output_log.open("w", encoding="utf-8")
-        ) as handle:
-            for log_path in log_paths:
+        for log_path in log_paths:
+            if args.max_items is not None and processed_items >= args.max_items:
+                break
+
+            try:
+                audit_context = parse_audit_log(log_path)
+                tex_path = resolve_current_tex_path(audit_context.tex_path, search_root)
+                fallback_bib_path = resolve_fallback_bib_path(
+                    audit_context.bibliography_paths,
+                    tex_path,
+                )
+            except RuntimeError as exc:
+                print(f"Warning: skipping {log_path.name}: {exc}", file=sys.stderr)
+                continue
+
+            if not audit_context.records:
+                print(f"Skipping {log_path.name}: no audit records found.", file=sys.stderr)
+                continue
+
+            records_to_process = audit_context.records
+            if retry_manifest is not None:
+                records_to_process = [
+                    record
+                    for record in audit_context.records
+                    if lookup_retry_manifest_row(
+                        retry_manifest,
+                        log_path=log_path,
+                        record_index=record.record_index,
+                    )
+                    is not None
+                ]
+                if not records_to_process:
+                    print(
+                        f"Skipping {log_path.name}: no retry-selected items.",
+                        file=sys.stderr,
+                    )
+                    continue
+
+            print(
+                f"Processing {log_path.name} with {len(records_to_process)} item(s)...",
+                file=sys.stderr,
+            )
+
+            for record in records_to_process:
                 if args.max_items is not None and processed_items >= args.max_items:
                     break
 
+                upload_temp_dir: Path | None = None
+                uploaded_file_refs: list[str] = []
+                baseline_id, baseline_num = baseline_fields_from_record(record)
+                result: dict[str, object] = {
+                    "baseline_id": baseline_id,
+                    "baseline_num": baseline_num,
+                    "ai_id": "",
+                    "ai_num": "",
+                    "provider": provider_runtime.name,
+                    "log_file": str(log_path),
+                    "record_index": record.record_index,
+                    "line_number": record.line_number,
+                    "body_context_lines": args.body_context_lines,
+                    "tex_file": str(tex_path),
+                    "status": "error",
+                    "output_text": "",
+                    "response_id": None,
+                    "response_status": None,
+                    "incomplete_details": None,
+                    "usage_details": None,
+                    "cost_details": None,
+                    "langfuse_trace_url": None,
+                    "raw_response_file": None,
+                    "error": None,
+                }
+
                 try:
-                    audit_context = parse_audit_log(log_path)
-                    tex_path = resolve_current_tex_path(audit_context.tex_path, search_root)
-                    fallback_bib_path = resolve_fallback_bib_path(
-                        audit_context.bibliography_paths,
-                        tex_path,
+                    upload_temp_dir = provider_runtime.module.create_upload_temp_dir()
+                    upload_inputs = prepare_upload_inputs(
+                        tex_path=tex_path,
+                        bib_path=fallback_bib_path,
+                        audit_log_path=log_path,
+                        log_entry_index=record.record_index,
+                        temp_dir=upload_temp_dir,
+                        body_context_lines=args.body_context_lines,
                     )
-                except RuntimeError as exc:
-                    print(f"Warning: skipping {log_path.name}: {exc}", file=sys.stderr)
-                    continue
+                    prompt = build_item_prompt(
+                        log_name=log_path.name,
+                        record_index=record.record_index,
+                        line_number=record.line_number,
+                        user_prompt=args.prompt,
+                        body_context_lines=args.body_context_lines,
+                    )
 
-                if not audit_context.records:
-                    print(f"Skipping {log_path.name}: no audit records found.", file=sys.stderr)
-                    continue
-
-                records_to_process = audit_context.records
-                if retry_manifest is not None:
-                    records_to_process = [
-                        record
-                        for record in audit_context.records
-                        if lookup_retry_manifest_row(
-                            retry_manifest,
-                            log_path=log_path,
-                            record_index=record.record_index,
+                    trace_context = (
+                        langfuse_runtime.client.start_as_current_observation(
+                            name=args.langfuse_trace_name,
+                            as_type="span",
+                            input=build_langfuse_batch_span_input(
+                                provider_name=provider_runtime.name,
+                                log_path=log_path,
+                                record_index=record.record_index,
+                                line_number=record.line_number,
+                                body_context_lines=args.body_context_lines,
+                                tex_path=tex_path,
+                                prompt=prompt,
+                                model=args.model,
+                                reasoning_effort=args.reasoning_effort,
+                                max_output_tokens=args.max_output_tokens,
+                                mcp_url=args.mcp_url,
+                                mcp_label=args.mcp_label,
+                                mcp_tools=mcp_tools,
+                            ),
+                            metadata=build_langfuse_batch_span_metadata(
+                                provider_name=provider_runtime.name,
+                                log_path=log_path,
+                                record_index=record.record_index,
+                                line_number=record.line_number,
+                                output_log=output_log,
+                            ),
                         )
-                        is not None
-                    ]
-                    if not records_to_process:
-                        print(
-                            f"Skipping {log_path.name}: no retry-selected items.",
-                            file=sys.stderr,
-                        )
-                        continue
-
-                print(
-                    f"Processing {log_path.name} with {len(records_to_process)} item(s)...",
-                    file=sys.stderr,
-                )
-
-                for record in records_to_process:
-                    if args.max_items is not None and processed_items >= args.max_items:
-                        break
-
-                    upload_temp_dir: Path | None = None
-                    uploaded_file_refs: list[str] = []
-                    result: dict[str, object] = {
-                        "provider": provider_runtime.name,
-                        "log_file": str(log_path),
-                        "record_index": record.record_index,
-                        "line_number": record.line_number,
-                        "tex_file": str(tex_path),
-                        "status": "error",
-                        "output_text": "",
-                        "gpt_name": "",
-                        "gpt_ext_source": "",
-                        "response_id": None,
-                        "response_status": None,
-                        "incomplete_details": None,
-                        "usage_details": None,
-                        "cost_details": None,
-                        "langfuse_trace_url": None,
-                        "raw_response_file": None,
-                        "error": None,
-                    }
-
-                    try:
-                        upload_temp_dir = provider_runtime.module.create_upload_temp_dir()
-                        upload_inputs = prepare_upload_inputs(
-                            tex_path=tex_path,
-                            bib_path=fallback_bib_path,
-                            audit_log_path=log_path,
-                            log_entry_index=record.record_index,
-                            temp_dir=upload_temp_dir,
-                        )
-                        prompt = build_item_prompt(
-                            log_name=log_path.name,
-                            record_index=record.record_index,
-                            line_number=record.line_number,
-                            user_prompt=args.prompt,
-                        )
-
-                        trace_context = (
-                            langfuse_runtime.client.start_as_current_observation(
-                                name=args.langfuse_trace_name,
-                                as_type="span",
-                                input=build_langfuse_batch_span_input(
-                                    provider_name=provider_runtime.name,
-                                    log_path=log_path,
-                                    record_index=record.record_index,
-                                    line_number=record.line_number,
-                                    tex_path=tex_path,
-                                    prompt=prompt,
-                                    model=args.model,
-                                    reasoning_effort=args.reasoning_effort,
-                                    max_output_tokens=args.max_output_tokens,
-                                    mcp_url=args.mcp_url,
-                                    mcp_label=args.mcp_label,
-                                    mcp_tools=mcp_tools,
-                                ),
-                                metadata=build_langfuse_batch_span_metadata(
-                                    provider_name=provider_runtime.name,
-                                    log_path=log_path,
-                                    record_index=record.record_index,
-                                    line_number=record.line_number,
-                                    output_log=output_log,
-                                ),
+                        if langfuse_runtime.enabled
+                        else nullcontext(None)
+                    )
+                    with trace_context as trace_observation:
+                        propagation_context = (
+                            langfuse_runtime.propagate_attributes(
+                                user_id=args.langfuse_user_id,
+                                session_id=args.langfuse_session_id,
+                                tags=args.langfuse_tags,
+                                trace_name=args.langfuse_trace_name,
+                                metadata={
+                                    "provider": provider_runtime.name,
+                                    "log_file": str(log_path),
+                                    "record_index": str(record.record_index),
+                                    "line_number": str(record.line_number),
+                                },
                             )
-                            if langfuse_runtime.enabled
-                            else nullcontext(None)
+                            if langfuse_runtime.enabled and langfuse_runtime.propagate_attributes
+                            else nullcontext()
                         )
-                        with trace_context as trace_observation:
-                            propagation_context = (
-                                langfuse_runtime.propagate_attributes(
-                                    user_id=args.langfuse_user_id,
-                                    session_id=args.langfuse_session_id,
-                                    tags=args.langfuse_tags,
-                                    trace_name=args.langfuse_trace_name,
+                        with propagation_context:
+                            generation_context = (
+                                langfuse_runtime.client.start_as_current_observation(
+                                    name=provider_runtime.generation_observation_name,
+                                    as_type="generation",
+                                    input={
+                                        "provider": provider_runtime.name,
+                                        "log_file": str(log_path),
+                                        "record_index": record.record_index,
+                                        "line_number": record.line_number,
+                                        "body_context_lines": args.body_context_lines,
+                                        "tex_file": str(upload_inputs.tex_path),
+                                        "bib_file": str(upload_inputs.bib_path),
+                                        "user_prompt": prompt,
+                                        "tools": {
+                                            "web_search_enabled": False,
+                                            "mcp_label": args.mcp_label,
+                                            "mcp_url": args.mcp_url,
+                                            "allowed_tools": mcp_tools,
+                                        },
+                                    },
                                     metadata={
                                         "provider": provider_runtime.name,
                                         "log_file": str(log_path),
-                                        "record_index": str(record.record_index),
-                                        "line_number": str(record.line_number),
+                                        "record_index": record.record_index,
+                                        "line_number": record.line_number,
+                                        "body_context_lines": args.body_context_lines,
+                                        "tex_filename": upload_inputs.tex_path.name,
+                                        "bib_filename": upload_inputs.bib_path.name,
+                                        "tool_policy": {
+                                            "web_search_enabled": False,
+                                            "mcp_only": True,
+                                        },
                                     },
+                                    model=args.model,
+                                    model_parameters=build_langfuse_model_parameters(args),
                                 )
-                                if langfuse_runtime.enabled and langfuse_runtime.propagate_attributes
-                                else nullcontext()
+                                if langfuse_runtime.enabled
+                                else nullcontext(None)
                             )
-                            with propagation_context:
-                                generation_context = (
-                                    langfuse_runtime.client.start_as_current_observation(
-                                        name=provider_runtime.generation_observation_name,
-                                        as_type="generation",
-                                        input={
-                                            "provider": provider_runtime.name,
-                                            "log_file": str(log_path),
-                                            "record_index": record.record_index,
-                                            "line_number": record.line_number,
-                                            "tex_file": str(upload_inputs.tex_path),
-                                            "bib_file": str(upload_inputs.bib_path),
-                                            "user_prompt": prompt,
-                                            "tools": {
-                                                "web_search_enabled": False,
-                                                "mcp_label": args.mcp_label,
-                                                "mcp_url": args.mcp_url,
-                                                "allowed_tools": mcp_tools,
-                                            },
-                                        },
-                                        metadata={
-                                            "provider": provider_runtime.name,
-                                            "log_file": str(log_path),
-                                            "record_index": record.record_index,
-                                            "line_number": record.line_number,
-                                            "tex_filename": upload_inputs.tex_path.name,
-                                            "bib_filename": upload_inputs.bib_path.name,
-                                            "tool_policy": {
-                                                "web_search_enabled": False,
-                                                "mcp_only": True,
-                                            },
-                                        },
+                            with generation_context as generation_observation:
+                                tex_upload = provider_runtime.module.upload_file(
+                                    client,
+                                    upload_inputs.tex_path,
+                                )
+                                bib_upload = provider_runtime.module.upload_file(
+                                    client,
+                                    upload_inputs.bib_path,
+                                )
+                                uploaded_file_refs.extend(
+                                    upload_file_refs(provider_runtime, tex_upload, bib_upload)
+                                )
+                                response, response_data = run_provider_response(
+                                    provider_runtime=provider_runtime,
+                                    client=client,
+                                    args=args,
+                                    prompt=prompt,
+                                    tex_upload=tex_upload,
+                                    bib_upload=bib_upload,
+                                    tex_upload_path=upload_inputs.tex_path,
+                                    bib_upload_path=upload_inputs.bib_path,
+                                    mcp_headers=mcp_headers,
+                                )
+                                output_text = provider_runtime.module.extract_output_text(
+                                    response,
+                                    response_data,
+                                )
+                                usage_details = provider_runtime.module.extract_langfuse_usage_details(
+                                    response,
+                                    response_data,
+                                )
+                                cost_details = compute_langfuse_cost_details(usage_details, pricing)
+                                ai_id, ai_num = parse_ai_response(output_text)
+                                response_status = extract_response_status(response_data)
+                                incomplete_details = response_data.get("incomplete_details")
+                                status = derive_result_status(response_status, output_text)
+                                result.update(
+                                    {
+                                        "status": status,
+                                        "output_text": output_text,
+                                        "ai_id": ai_id,
+                                        "ai_num": ai_num,
+                                        "response_id": extract_response_id(response_data),
+                                        "response_status": response_status or None,
+                                        "incomplete_details": incomplete_details,
+                                        "usage_details": usage_details or None,
+                                        "cost_details": cost_details or None,
+                                    }
+                                )
+                                if generation_observation is not None:
+                                    generation_observation.update(
+                                        output=build_langfuse_generation_output(
+                                            response_data=response_data,
+                                            output_text=output_text,
+                                            usage_details=usage_details,
+                                            cost_details=cost_details,
+                                        ),
+                                        metadata=build_langfuse_generation_result_metadata(
+                                            pricing=pricing,
+                                            usage_details=usage_details,
+                                            cost_details=cost_details,
+                                        ),
                                         model=args.model,
                                         model_parameters=build_langfuse_model_parameters(args),
+                                        usage_details=usage_details or None,
+                                        cost_details=cost_details or None,
                                     )
-                                    if langfuse_runtime.enabled
-                                    else nullcontext(None)
-                                )
-                                with generation_context as generation_observation:
-                                    tex_upload = provider_runtime.module.upload_file(
-                                        client,
-                                        upload_inputs.tex_path,
-                                    )
-                                    bib_upload = provider_runtime.module.upload_file(
-                                        client,
-                                        upload_inputs.bib_path,
-                                    )
-                                    uploaded_file_refs.extend(
-                                        upload_file_refs(provider_runtime, tex_upload, bib_upload)
-                                    )
-                                    response, response_data = run_provider_response(
-                                        provider_runtime=provider_runtime,
-                                        client=client,
-                                        args=args,
-                                        prompt=prompt,
-                                        tex_upload=tex_upload,
-                                        bib_upload=bib_upload,
-                                        tex_upload_path=upload_inputs.tex_path,
-                                        bib_upload_path=upload_inputs.bib_path,
-                                        mcp_headers=mcp_headers,
-                                    )
-                                    output_text = provider_runtime.module.extract_output_text(
-                                        response,
-                                        response_data,
-                                    )
-                                    usage_details = provider_runtime.module.extract_langfuse_usage_details(
-                                        response,
-                                        response_data,
-                                    )
-                                    cost_details = compute_langfuse_cost_details(usage_details, pricing)
-                                    gpt_name, gpt_ext_source = parse_gpt_response(output_text)
-                                    response_status = extract_response_status(response_data)
-                                    incomplete_details = response_data.get("incomplete_details")
-                                    status = derive_result_status(response_status, output_text)
-                                    result.update(
-                                        {
-                                            "status": status,
-                                            "output_text": output_text,
-                                            "gpt_name": gpt_name,
-                                            "gpt_ext_source": gpt_ext_source,
-                                            "response_id": extract_response_id(response_data),
-                                            "response_status": response_status or None,
-                                            "incomplete_details": incomplete_details,
-                                            "usage_details": usage_details or None,
-                                            "cost_details": cost_details or None,
-                                        }
-                                    )
-                                    if generation_observation is not None:
-                                        generation_observation.update(
-                                            output=build_langfuse_generation_output(
-                                                response_data=response_data,
-                                                output_text=output_text,
-                                                usage_details=usage_details,
-                                                cost_details=cost_details,
-                                            ),
-                                            metadata=build_langfuse_generation_result_metadata(
-                                                pricing=pricing,
-                                                usage_details=usage_details,
-                                                cost_details=cost_details,
-                                            ),
-                                            model=args.model,
-                                            model_parameters=build_langfuse_model_parameters(args),
-                                            usage_details=usage_details or None,
-                                            cost_details=cost_details or None,
+                                    result["langfuse_trace_url"] = langfuse_runtime.client.get_trace_url()
+                                if trace_observation is not None:
+                                    trace_observation.update(
+                                        output=build_langfuse_batch_span_output(
+                                            response_data=response_data,
+                                            output_text=output_text,
+                                            usage_details=usage_details,
+                                            cost_details=cost_details,
+                                            result_status=status,
                                         )
-                                        result["langfuse_trace_url"] = langfuse_runtime.client.get_trace_url()
-                                    if trace_observation is not None:
-                                        trace_observation.update(
-                                            output=build_langfuse_batch_span_output(
-                                                response_data=response_data,
-                                                output_text=output_text,
-                                                usage_details=usage_details,
-                                                cost_details=cost_details,
-                                                result_status=status,
-                                            )
-                                        )
-                                    if status != "ok":
-                                        raw_response_path = make_raw_response_path(
-                                            raw_response_dir=raw_response_dir,
-                                            log_path=log_path,
-                                            record_index=record.record_index,
-                                        )
-                                        raw_response_path.write_text(
-                                            json.dumps(response_data, ensure_ascii=False, indent=2),
-                                            encoding="utf-8",
-                                        )
-                                        result["raw_response_file"] = str(raw_response_path)
-                                        print(
-                                            f"Warning: {log_path.name} item {record.record_index} returned "
-                                            f"status={status}"
-                                            + (
-                                                f" (response_status={response_status})."
-                                                if response_status
-                                                else "."
-                                            ),
-                                            file=sys.stderr,
-                                        )
-                    except Exception as exc:
-                        result["error"] = format_exception_message(exc)
-                        print(
-                            f"Warning: {provider_runtime.label} query failed for "
-                            f"{log_path.name} item {record.record_index}: "
-                            f"{format_exception_message(exc)}",
-                            file=sys.stderr,
+                                    )
+                                if status != "ok":
+                                    raw_response_path = make_raw_response_path(
+                                        raw_response_dir=raw_response_dir,
+                                        log_path=log_path,
+                                        record_index=record.record_index,
+                                    )
+                                    raw_response_path.write_text(
+                                        json.dumps(response_data, ensure_ascii=False, indent=2),
+                                        encoding="utf-8",
+                                    )
+                                    result["raw_response_file"] = str(raw_response_path)
+                                    print(
+                                        f"Warning: {log_path.name} item {record.record_index} returned "
+                                        f"status={status}"
+                                        + (
+                                            f" (response_status={response_status})."
+                                            if response_status
+                                            else "."
+                                        ),
+                                        file=sys.stderr,
+                                    )
+                except Exception as exc:
+                    result["error"] = format_exception_message(exc)
+                    print(
+                        f"Warning: {provider_runtime.label} query failed for "
+                        f"{log_path.name} item {record.record_index}: "
+                        f"{format_exception_message(exc)}",
+                        file=sys.stderr,
+                    )
+                finally:
+                    provider_runtime.module.cleanup_upload_temp_dir(upload_temp_dir)
+                    if args.delete_uploads:
+                        provider_runtime.module.cleanup_uploaded_files(
+                            client,
+                            uploaded_file_refs,
                         )
-                    finally:
-                        provider_runtime.module.cleanup_upload_temp_dir(upload_temp_dir)
-                        if args.delete_uploads:
-                            provider_runtime.module.cleanup_uploaded_files(
-                                client,
-                                uploaded_file_refs,
-                            )
 
-                    if pending_update_rows is not None:
-                        pending_update_rows.append(dict(result))
-                    else:
-                        handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-                        handle.flush()
-                    processed_items += 1
+                result_rows.append(dict(result))
+                processed_items += 1
 
-        if pending_update_rows is not None:
+        if args.update_existing_log:
             try:
                 existing_rows = load_result_log_rows(output_log)
             except RuntimeError as exc:
@@ -1372,12 +1459,12 @@ def main() -> int:
 
             merge_outcome = merge_result_log_rows(
                 existing_rows,
-                pending_update_rows,
+                result_rows,
                 default_provider=provider_runtime.name,
             )
-            with output_log.open("w", encoding="utf-8") as handle:
-                for row in merge_outcome.rows:
-                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            write_result_csv_rows(output_log, merge_outcome.rows)
+        else:
+            write_result_csv_rows(output_log, result_rows)
     finally:
         if "langfuse_runtime" in locals() and langfuse_runtime.enabled:
             flush_langfuse(langfuse_runtime)
@@ -1387,7 +1474,7 @@ def main() -> int:
             except Exception:
                 pass
 
-    if pending_update_rows is not None:
+    if args.update_existing_log:
         print(
             f"Updated {output_log} with {processed_items} {provider_runtime.label} retry "
             f"result(s) ({merge_outcome.replaced_count} replaced, "

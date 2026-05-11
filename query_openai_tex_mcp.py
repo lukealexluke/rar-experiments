@@ -18,6 +18,7 @@ from statement_reference_audit import (
     find_macro_occurrences,
     iter_bbl_entries,
     iter_bib_entries,
+    normalize_arxiv_id,
     read_candidate_text,
 )
 
@@ -31,6 +32,7 @@ DEFAULT_MCP_URL = "https://api.theoremsearch.com/mcp"
 DEFAULT_ALLOWED_MCP_TOOLS = ("theorem_search",)
 DEFAULT_APPROVAL_LIMIT = 8
 DEFAULT_DOTENV_FILENAME = ".env"
+DEFAULT_BODY_CONTEXT_LINES = 20
 DEFAULT_LANGFUSE_TRACE_NAME = "tex-bib-mcp-query"
 DEFAULT_LANGFUSE_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 DEFAULT_LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
@@ -40,7 +42,25 @@ DEFAULT_OPENAI_OUTPUT_COST_ENV = "OPENAI_OUTPUT_COST_PER_1M"
 AUDIT_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+")
 WHOLEBODY_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+Line:\s+(\d+)$")
 STATEMENT_LOG_LINE_RE = re.compile(r"^Line:\s+(\d+)$")
-ARXIV_CITATION_KEY_RE = re.compile(r"([^,\[\]]+?)\s*\[[^\]]+\]")
+ARXIV_CITATION_ENTRY_RE = re.compile(r"([^,\[\]]+?)\s*\[([^\]]+)\]")
+CITATION_LOCATOR_RE = re.compile(
+    r"\b(?:theorems?|thms?\.?|thm\.?|lemmas?|lems?\.?|lem\.?|"
+    r"corollaries|cors?\.?|cor\.?|propositions?|props?\.?|prop\.?|"
+    r"claims?|conjectures?|definitions?|defs?\.?|defn\.?)\s*"
+    r"[A-Za-z0-9][A-Za-z0-9().:-]*",
+    re.IGNORECASE,
+)
+LOCATOR_PREFIX_RE = re.compile(
+    r"^(theorems?|thms?\.?|thm\.?|lemmas?|lems?\.?|lem\.?|"
+    r"corollaries|cors?\.?|cor\.?|propositions?|props?\.?|prop\.?|"
+    r"claims?|conjectures?|definitions?|defs?\.?|defn\.?)\s*(.+)$",
+    re.IGNORECASE,
+)
+BEGIN_DOCUMENT_RE = re.compile(r"\\begin\s*\{\s*document\s*\}")
+END_DOCUMENT_RE = re.compile(r"\\end\s*\{\s*document\s*\}")
+BIBLIOGRAPHY_START_RE = re.compile(
+    r"^\s*\\(?:bibliography\b|printbibliography\b|begin\s*\{\s*thebibliography\s*\})"
+)
 LOG_SEPARATOR_LINE = "-" * 80
 
 
@@ -89,6 +109,8 @@ class AuditLogRecord:
     bib_keys: tuple[str, ...]
     line_text: str = ""
     original_statement: str = ""
+    baseline_id: str = ""
+    baseline_num: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,6 +131,16 @@ class PreparedUploadInputs:
     audit_record_index: int | None = None
 
 
+def parse_nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -127,9 +159,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Optional statement audit log path. When provided, the uploaded TeX is "
-            "truncated at the selected logged line, the logged citation is masked as "
-            "[Citation Needed], and the logged bibliography entry is removed from the "
-            "uploaded bibliography text."
+            "reduced to a masked main-body excerpt around the selected logged line, "
+            "and the logged bibliography entry is removed from the uploaded "
+            "bibliography text."
         ),
     )
     parser.add_argument(
@@ -138,6 +170,19 @@ def parse_args() -> argparse.Namespace:
         help=(
             "1-based audit-log entry index to sanitize against. Required when the "
             "selected audit log contains multiple entries."
+        ),
+    )
+    parser.add_argument(
+        "--tex-context-lines",
+        "--body-context-lines",
+        "--context-lines",
+        dest="body_context_lines",
+        type=parse_nonnegative_int,
+        default=DEFAULT_BODY_CONTEXT_LINES,
+        metavar="N",
+        help=(
+            "Number of main TeX body lines before and after the logged citation line to upload. "
+            f"Defaults to {DEFAULT_BODY_CONTEXT_LINES}."
         ),
     )
     parser.add_argument(
@@ -279,6 +324,7 @@ def prepare_upload_inputs(
     audit_log_path: Path | None,
     log_entry_index: int | None,
     temp_dir: Path,
+    body_context_lines: int = DEFAULT_BODY_CONTEXT_LINES,
 ) -> PreparedUploadInputs:
     status_messages: list[str] = []
     prompt_note: str | None = None
@@ -304,10 +350,12 @@ def prepare_upload_inputs(
             tex_path=tex_path,
             record=selected_record,
             temp_dir=temp_dir,
+            body_context_lines=body_context_lines,
         )
         status_messages.append(
             f"Using audit log {effective_log_path.name} entry {selected_record.record_index} "
-            f"at line {selected_record.line_number}; uploading truncated masked TeX."
+            f"at line {selected_record.line_number}; uploading masked TeX excerpt with "
+            f"up to {body_context_lines} main-body line(s) on each side."
         )
         if selected_record.bib_keys:
             status_messages.append(
@@ -315,10 +363,12 @@ def prepare_upload_inputs(
                 + ", ".join(selected_record.bib_keys)
             )
         prompt_note = (
-            f"The uploaded LaTeX source has been truncated to end at line {selected_record.line_number} "
-            "from the associated audit log. The logged citation on that line has been replaced with "
-            "[Citation Needed]. The matching bibliography entry has been removed from the uploaded "
-            "bibliography text when it could be identified."
+            "The uploaded LaTeX source is a main-body excerpt from the associated "
+            f"audit log containing up to {body_context_lines} line(s) before and after "
+            f"line {selected_record.line_number}. The logged citation on that line has "
+            "been replaced with [Citation Needed]. The bibliography upload is not "
+            "line-windowed; the matching bibliography entry has been removed from the "
+            "uploaded bibliography text when it could be identified."
         )
     elif bib_path.suffix.lower() != ".txt":
         status_messages.append(
@@ -452,6 +502,8 @@ def parse_statement_audit_log_records(lines: Sequence[str]) -> list[AuditLogReco
         index += 1
         line_number: int | None = None
         bib_keys: list[str] = []
+        arxiv_ids: list[str] = []
+        arxiv_ids_by_key: dict[str, list[str]] = {}
         original_statement_lines: list[str] = []
 
         while index < len(lines) and lines[index].strip() != LOG_SEPARATOR_LINE:
@@ -464,7 +516,12 @@ def parse_statement_audit_log_records(lines: Sequence[str]) -> list[AuditLogReco
             if line == "ArXiv citations:":
                 index += 1
                 while index < len(lines) and lines[index].startswith("  - "):
-                    bib_keys.extend(extract_bib_keys_from_log_line(lines[index]))
+                    for key, entry_arxiv_ids in extract_arxiv_citation_entries_from_log_line(
+                        lines[index]
+                    ):
+                        bib_keys.append(key)
+                        arxiv_ids.extend(entry_arxiv_ids)
+                        arxiv_ids_by_key.setdefault(key, []).extend(entry_arxiv_ids)
                     index += 1
                 continue
             if line == "Original statement:":
@@ -478,12 +535,23 @@ def parse_statement_audit_log_records(lines: Sequence[str]) -> list[AuditLogReco
         if line_number is None:
             raise RuntimeError(f"Missing line number in audit log entry [{record_index}]")
 
+        original_statement = "\n".join(original_statement_lines).strip()
+        baseline_num, locator_keys = extract_baseline_locator_and_keys_from_statement(
+            original_statement,
+            bib_keys,
+        )
+        baseline_id = first_arxiv_id_for_keys(locator_keys, arxiv_ids_by_key)
+        if not baseline_id:
+            baseline_id = first_or_empty(dedupe_preserving_order(arxiv_ids))
+
         records.append(
             AuditLogRecord(
                 record_index=record_index,
                 line_number=line_number,
                 bib_keys=tuple(dedupe_preserving_order(bib_keys)),
-                original_statement="\n".join(original_statement_lines).strip(),
+                original_statement=original_statement,
+                baseline_id=baseline_id,
+                baseline_num=baseline_num,
             )
         )
         index += 1
@@ -501,7 +569,16 @@ def parse_wholebody_audit_log_records(lines: Sequence[str]) -> list[AuditLogReco
 
         record_index = int(match.group(1))
         line_number = int(match.group(2))
-        line_text = lines[index + 1].rstrip() if index + 1 < len(lines) else ""
+        cursor = index + 1
+        baseline_num = ""
+        baseline_id = ""
+        if cursor < len(lines) and lines[cursor].startswith("Name: "):
+            baseline_num = lines[cursor][len("Name: ") :].strip()
+            cursor += 1
+        if cursor < len(lines) and lines[cursor].startswith("External Source: "):
+            baseline_id = lines[cursor][len("External Source: ") :].strip()
+            cursor += 1
+        line_text = lines[cursor].rstrip() if cursor < len(lines) else ""
         bib_keys = extract_citation_keys_from_text(line_text)
         records.append(
             AuditLogRecord(
@@ -509,6 +586,8 @@ def parse_wholebody_audit_log_records(lines: Sequence[str]) -> list[AuditLogReco
                 line_number=line_number,
                 bib_keys=tuple(bib_keys),
                 line_text=line_text,
+                baseline_id=baseline_id,
+                baseline_num=baseline_num,
             )
         )
         index += 1
@@ -547,7 +626,12 @@ def write_sanitized_tex_upload(
     tex_path: Path,
     record: AuditLogRecord,
     temp_dir: Path,
+    body_context_lines: int = DEFAULT_BODY_CONTEXT_LINES,
 ) -> Path:
+    if body_context_lines < 0:
+        raise RuntimeError(
+            f"body_context_lines must be non-negative, got {body_context_lines}"
+        )
     tex_lines = read_candidate_text(tex_path).splitlines(keepends=True)
     if record.line_number < 1:
         raise RuntimeError(f"Invalid audit log line number {record.line_number} for {tex_path}")
@@ -556,14 +640,51 @@ def write_sanitized_tex_upload(
             f"Audit log line {record.line_number} exceeds the TeX length {len(tex_lines)} for {tex_path}"
         )
 
-    truncated_lines = tex_lines[: record.line_number]
-    truncated_lines[-1] = mask_logged_citations_in_line(
-        truncated_lines[-1],
+    target_index = record.line_number - 1
+    body_start_index, body_end_index = find_main_body_line_bounds(tex_lines)
+    start_index = max(0, target_index - body_context_lines)
+    end_index = min(len(tex_lines), target_index + body_context_lines + 1)
+    if body_start_index <= target_index < body_end_index:
+        start_index = max(start_index, body_start_index)
+        end_index = min(end_index, body_end_index)
+
+    window_lines = list(tex_lines[start_index:end_index])
+    target_window_index = target_index - start_index
+    window_lines[target_window_index] = mask_logged_citations_in_line(
+        window_lines[target_window_index],
         record.bib_keys,
     )
-    output_path = temp_dir / f"{tex_path.stem}_log_{record.record_index}_truncated.tex"
-    output_path.write_text("".join(truncated_lines), encoding="utf-8")
+    start_line = start_index + 1
+    end_line = end_index
+    header_lines = [
+        f"% Excerpt from {tex_path.name}; original lines {start_line}-{end_line}.\n",
+        (
+            f"% Target citation line: {record.line_number}; "
+            f"{body_context_lines} context line(s) requested on each side.\n\n"
+        ),
+    ]
+    output_path = (
+        temp_dir
+        / f"{tex_path.stem}_log_{record.record_index}_lines_{start_line}_{end_line}.tex"
+    )
+    output_path.write_text("".join(header_lines + window_lines), encoding="utf-8")
     return output_path
+
+
+def find_main_body_line_bounds(tex_lines: Sequence[str]) -> tuple[int, int]:
+    body_start_index = 0
+    for index, line in enumerate(tex_lines):
+        if BEGIN_DOCUMENT_RE.search(line):
+            body_start_index = index + 1
+            break
+
+    body_end_index = len(tex_lines)
+    for index in range(body_start_index, len(tex_lines)):
+        line = tex_lines[index]
+        if END_DOCUMENT_RE.search(line) or BIBLIOGRAPHY_START_RE.search(line):
+            body_end_index = index
+            break
+    return body_start_index, body_end_index
 
 
 def mask_logged_citations_in_line(line_text: str, bib_keys: Sequence[str]) -> str:
@@ -640,14 +761,143 @@ def filter_bibliography_text(text: str, excluded_keys: Sequence[str]) -> str:
 
 
 def extract_bib_keys_from_log_line(line: str) -> list[str]:
+    return [
+        key
+        for key, _arxiv_ids in extract_arxiv_citation_entries_from_log_line(line)
+    ]
+
+
+def extract_arxiv_ids_from_log_line(line: str) -> list[str]:
+    arxiv_ids: list[str] = []
+    for _key, entry_arxiv_ids in extract_arxiv_citation_entries_from_log_line(line):
+        arxiv_ids.extend(entry_arxiv_ids)
+    return dedupe_preserving_order(arxiv_ids)
+
+
+def extract_arxiv_citation_entries_from_log_line(line: str) -> list[tuple[str, list[str]]]:
     _, _, payload = line.partition("->")
     if not payload:
         return []
-    return [
-        match.group(1).strip()
-        for match in ARXIV_CITATION_KEY_RE.finditer(payload)
-        if match.group(1).strip()
+
+    entries: list[tuple[str, list[str]]] = []
+    for match in ARXIV_CITATION_ENTRY_RE.finditer(payload):
+        key = match.group(1).strip()
+        if not key:
+            continue
+        arxiv_ids: list[str] = []
+        for raw_id in match.group(2).split(","):
+            cleaned = raw_id.strip()
+            if cleaned:
+                arxiv_ids.append(normalize_arxiv_id(cleaned))
+        entries.append((key, dedupe_preserving_order(arxiv_ids)))
+    return entries
+
+
+def extract_baseline_locator_from_statement(statement: str, bib_keys: Sequence[str]) -> str:
+    locator, _keys = extract_baseline_locator_and_keys_from_statement(statement, bib_keys)
+    return locator
+
+
+def extract_baseline_locator_and_keys_from_statement(
+    statement: str,
+    bib_keys: Sequence[str],
+) -> tuple[str, list[str]]:
+    if not statement.strip():
+        return "", []
+
+    key_set = {key for key in bib_keys if key}
+    occurrences = list(find_macro_occurrences(statement, set(DEFAULT_CITE_COMMANDS)))
+    matching_occurrences = [
+        occurrence
+        for occurrence in occurrences
+        if not key_set or any(key in key_set for key in occurrence.keys)
     ]
+    if not matching_occurrences:
+        matching_occurrences = occurrences
+
+    for occurrence in matching_occurrences:
+        locator = extract_locator_from_citation_occurrence(occurrence)
+        if locator:
+            return locator, list(occurrence.keys)
+    return "", []
+
+
+def first_arxiv_id_for_keys(
+    keys: Sequence[str],
+    arxiv_ids_by_key: dict[str, list[str]],
+) -> str:
+    for key in keys:
+        for arxiv_id in arxiv_ids_by_key.get(key, []):
+            if arxiv_id:
+                return arxiv_id
+    return ""
+
+
+def extract_locator_from_citation_occurrence(occurrence) -> str:
+    candidates: list[str] = []
+    if occurrence.postnote:
+        candidates.append(occurrence.postnote)
+    candidates.extend(reversed(occurrence.optional_args))
+
+    for candidate in candidates:
+        locator = extract_locator_from_text(candidate)
+        if locator:
+            return locator
+    return ""
+
+
+def extract_locator_from_text(text: str) -> str:
+    cleaned = clean_tex_locator_text(text)
+    match = CITATION_LOCATOR_RE.search(cleaned)
+    if not match:
+        return ""
+    return canonicalize_statement_locator(match.group(0))
+
+
+def clean_tex_locator_text(text: str) -> str:
+    cleaned = text.replace("~", " ")
+    cleaned = re.sub(r"\\[,;:! ]", " ", cleaned)
+    cleaned = cleaned.replace("{", " ").replace("}", " ").replace("$", " ")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def canonicalize_statement_locator(text: str) -> str:
+    cleaned = clean_tex_locator_text(text)
+    cleaned = re.sub(r"[,:;]+$", "", cleaned).strip()
+    match = LOCATOR_PREFIX_RE.match(cleaned)
+    if not match:
+        return cleaned
+
+    raw_prefix = match.group(1).rstrip(".").lower()
+    suffix = match.group(2).strip()
+    display_prefix = {
+        "theorem": "Theorem",
+        "theorems": "Theorem",
+        "thm": "Theorem",
+        "thms": "Theorem",
+        "lemma": "Lemma",
+        "lemmas": "Lemma",
+        "lem": "Lemma",
+        "lems": "Lemma",
+        "corollary": "Corollary",
+        "corollaries": "Corollary",
+        "cor": "Corollary",
+        "cors": "Corollary",
+        "proposition": "Proposition",
+        "propositions": "Proposition",
+        "prop": "Proposition",
+        "props": "Proposition",
+        "claim": "Claim",
+        "claims": "Claim",
+        "conjecture": "Conjecture",
+        "conjectures": "Conjecture",
+        "definition": "Definition",
+        "definitions": "Definition",
+        "def": "Definition",
+        "defs": "Definition",
+        "defn": "Definition",
+    }.get(raw_prefix, match.group(1).rstrip("."))
+    return f"{display_prefix} {suffix}".strip()
 
 
 def extract_citation_keys_from_text(text: str) -> list[str]:
@@ -666,6 +916,10 @@ def dedupe_preserving_order(values: Sequence[str]) -> list[str]:
         seen.add(value)
         ordered.append(value)
     return ordered
+
+
+def first_or_empty(values: Sequence[str]) -> str:
+    return values[0] if values else ""
 
 
 def sanitize_for_filename(value: str) -> str:
@@ -734,6 +988,7 @@ def main() -> int:
             audit_log_path=resolved_audit_log,
             log_entry_index=args.log_entry,
             temp_dir=upload_temp_dir,
+            body_context_lines=args.body_context_lines,
         )
         for message in upload_inputs.status_messages:
             print(message, file=sys.stderr)
@@ -1042,9 +1297,11 @@ def build_user_prompt(
     context_note: str | None = None,
 ) -> str:
     instruction = user_prompt.strip() if user_prompt else (
-        "Read the attached LaTeX source and bibliography, then answer "
-        "helpfully. Use theorem_search when it would improve factual or "
-        "literature-grounded answers."
+        "Read the attached LaTeX source and bibliography, identify the missing "
+        "citation, and return JSON only with exactly these keys: "
+        '{"ai_id": <external arXiv identifier or null>, '
+        '"ai_num": <cited theorem-like result name/number or null>}. '
+        "Use theorem_search when it would improve factual or literature-grounded answers."
     )
     context_block = f"{context_note.strip()}\n\n" if context_note and context_note.strip() else ""
     return (

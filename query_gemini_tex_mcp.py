@@ -15,6 +15,7 @@ from typing import Any
 from query_openai_tex_mcp import (
     DEFAULT_ALLOWED_MCP_TOOLS,
     DEFAULT_APPROVAL_LIMIT,
+    DEFAULT_BODY_CONTEXT_LINES,
     DEFAULT_LANGFUSE_TRACE_NAME,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MCP_LABEL,
@@ -35,6 +36,7 @@ from query_openai_tex_mcp import (
     compute_langfuse_cost_details,
     flush_langfuse,
     load_environment_from_dotenv,
+    parse_nonnegative_int,
     parse_mcp_headers,
     prepare_upload_inputs,
     read_api_key,
@@ -110,9 +112,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Optional statement audit log path. When provided, the uploaded TeX is "
-            "truncated at the selected logged line, the logged citation is masked as "
-            "[Citation Needed], and the logged bibliography entry is removed from the "
-            "uploaded bibliography text."
+            "reduced to a masked main-body excerpt around the selected logged line, "
+            "and the logged bibliography entry is removed from the uploaded "
+            "bibliography text."
         ),
     )
     parser.add_argument(
@@ -121,6 +123,19 @@ def parse_args() -> argparse.Namespace:
         help=(
             "1-based audit-log entry index to sanitize against. Required when the "
             "selected audit log contains multiple entries."
+        ),
+    )
+    parser.add_argument(
+        "--tex-context-lines",
+        "--body-context-lines",
+        "--context-lines",
+        dest="body_context_lines",
+        type=parse_nonnegative_int,
+        default=DEFAULT_BODY_CONTEXT_LINES,
+        metavar="N",
+        help=(
+            "Number of main TeX body lines before and after the logged citation line to upload. "
+            f"Defaults to {DEFAULT_BODY_CONTEXT_LINES}."
         ),
     )
     parser.add_argument(
@@ -686,6 +701,7 @@ def main() -> int:
             audit_log_path=resolved_audit_log,
             log_entry_index=args.log_entry,
             temp_dir=upload_temp_dir,
+            body_context_lines=args.body_context_lines,
         )
         for message in upload_inputs.status_messages:
             print(message, file=sys.stderr)
