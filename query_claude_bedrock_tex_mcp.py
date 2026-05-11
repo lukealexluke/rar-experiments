@@ -5,6 +5,7 @@ import argparse
 import asyncio
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 import json
 import os
 import re
@@ -55,6 +56,9 @@ DEFAULT_API_KEY_ENV = ""
 DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_AWS_REGION = "us-east-1"
+DEFAULT_BEDROCK_CONNECT_TIMEOUT = 30.0
+DEFAULT_BEDROCK_READ_TIMEOUT = 600.0
+DEFAULT_MCP_READ_TIMEOUT = 300.0
 DEFAULT_CLAUDE_INPUT_COST_ENV = "CLAUDE_BEDROCK_INPUT_COST_PER_1M"
 DEFAULT_CLAUDE_CACHED_INPUT_COST_ENV = "CLAUDE_BEDROCK_CACHED_INPUT_COST_PER_1M"
 DEFAULT_CLAUDE_OUTPUT_COST_ENV = "CLAUDE_BEDROCK_OUTPUT_COST_PER_1M"
@@ -175,6 +179,26 @@ def parse_args() -> argparse.Namespace:
         help="Optional custom bedrock-runtime endpoint URL.",
     )
     parser.add_argument(
+        "--bedrock-connect-timeout",
+        type=float,
+        default=DEFAULT_BEDROCK_CONNECT_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "Bedrock client connect timeout in seconds. "
+            f"Defaults to {DEFAULT_BEDROCK_CONNECT_TIMEOUT:g}."
+        ),
+    )
+    parser.add_argument(
+        "--bedrock-read-timeout",
+        type=float,
+        default=DEFAULT_BEDROCK_READ_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "Bedrock client read timeout in seconds. "
+            f"Defaults to {DEFAULT_BEDROCK_READ_TIMEOUT:g}."
+        ),
+    )
+    parser.add_argument(
         "--mcp-url",
         default=DEFAULT_MCP_URL,
         help=f"Remote MCP server URL. Defaults to {DEFAULT_MCP_URL}.",
@@ -199,6 +223,16 @@ def parse_args() -> argparse.Namespace:
         action="append",
         metavar="KEY=VALUE",
         help="Optional HTTP header to send to the MCP server. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--mcp-read-timeout",
+        type=float,
+        default=DEFAULT_MCP_READ_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "Timeout for individual MCP tool calls in seconds. "
+            f"Defaults to {DEFAULT_MCP_READ_TIMEOUT:g}."
+        ),
     )
     parser.add_argument(
         "--disable-langfuse",
@@ -336,6 +370,8 @@ def make_client_from_args(args: argparse.Namespace, *, enable_langfuse: bool):
         region_name=args.aws_region,
         profile_name=args.aws_profile,
         endpoint_url=args.bedrock_endpoint_url,
+        connect_timeout=args.bedrock_connect_timeout,
+        read_timeout=args.bedrock_read_timeout,
     )
 
 
@@ -346,12 +382,15 @@ def make_client(
     region_name: str | None = None,
     profile_name: str | None = None,
     endpoint_url: str | None = None,
+    connect_timeout: float = DEFAULT_BEDROCK_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_BEDROCK_READ_TIMEOUT,
 ):
     try:
         import boto3
+        from botocore.config import Config
     except ImportError as exc:
         raise RuntimeError(
-            "The `boto3` package is not installed. Install it with "
+            "The `boto3`/`botocore` packages are not installed. Install them with "
             "`pip install boto3` and rerun the script."
         ) from exc
 
@@ -363,7 +402,13 @@ def make_client(
             if profile
             else boto3.Session(region_name=region)
         )
-        client_kwargs: dict[str, str] = {}
+        client_kwargs: dict[str, Any] = {
+            "config": Config(
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                retries={"max_attempts": 3, "mode": "standard"},
+            )
+        }
         if endpoint_url:
             client_kwargs["endpoint_url"] = endpoint_url
         runtime_client = session.client("bedrock-runtime", **client_kwargs)
@@ -402,6 +447,7 @@ def run_response(
     mcp_url: str,
     requested_tools: list[str],
     mcp_headers: dict[str, str],
+    mcp_read_timeout: float = DEFAULT_MCP_READ_TIMEOUT,
 ):
     return asyncio.run(
         _run_response_async(
@@ -416,6 +462,7 @@ def run_response(
             mcp_url=mcp_url,
             requested_tools=requested_tools,
             mcp_headers=mcp_headers,
+            mcp_read_timeout=mcp_read_timeout,
         )
     )
 
@@ -432,6 +479,7 @@ async def _run_response_async(
     mcp_url: str,
     requested_tools: list[str],
     mcp_headers: dict[str, str],
+    mcp_read_timeout: float,
 ):
     try:
         import httpx
@@ -445,6 +493,7 @@ async def _run_response_async(
     http_client = httpx.AsyncClient(
         headers=mcp_headers or None,
         follow_redirects=True,
+        timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0),
     )
     async with http_client:
         async with streamable_http_client(
@@ -504,6 +553,7 @@ async def _run_response_async(
                                 session=session,
                                 tool_use=tool_use,
                                 allowed_tool_names=set(available_tool_names),
+                                mcp_read_timeout=mcp_read_timeout,
                             )
                         )
                     messages.append({"role": "user", "content": tool_result_blocks})
@@ -671,6 +721,7 @@ async def call_mcp_tool_for_bedrock(
     session: Any,
     tool_use: dict[str, Any],
     allowed_tool_names: set[str],
+    mcp_read_timeout: float,
 ) -> dict[str, Any]:
     tool_use_id = str(tool_use.get("toolUseId") or "")
     tool_name = str(tool_use.get("name") or "")
@@ -692,7 +743,16 @@ async def call_mcp_tool_for_bedrock(
         )
 
     try:
-        result = await session.call_tool(tool_name, arguments=tool_input)
+        read_timeout = (
+            timedelta(seconds=mcp_read_timeout)
+            if mcp_read_timeout and mcp_read_timeout > 0
+            else None
+        )
+        result = await session.call_tool(
+            tool_name,
+            arguments=tool_input,
+            read_timeout_seconds=read_timeout,
+        )
         return build_tool_result_block(
             tool_use_id=tool_use_id,
             payload=safe_serialize_value(result),
@@ -950,6 +1010,7 @@ def main() -> int:
                         mcp_url=args.mcp_url,
                         requested_tools=mcp_tools,
                         mcp_headers=mcp_headers,
+                        mcp_read_timeout=args.mcp_read_timeout,
                     )
                     if thinking_note:
                         print(thinking_note, file=sys.stderr)

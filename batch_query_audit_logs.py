@@ -219,6 +219,26 @@ def parse_args() -> argparse.Namespace:
         help="Optional custom bedrock-runtime endpoint URL for --provider claude.",
     )
     parser.add_argument(
+        "--bedrock-connect-timeout",
+        type=float,
+        default=claude_query.DEFAULT_BEDROCK_CONNECT_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "Bedrock connect timeout for --provider claude. Defaults to "
+            f"{claude_query.DEFAULT_BEDROCK_CONNECT_TIMEOUT:g} seconds."
+        ),
+    )
+    parser.add_argument(
+        "--bedrock-read-timeout",
+        type=float,
+        default=claude_query.DEFAULT_BEDROCK_READ_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "Bedrock read timeout for --provider claude. Defaults to "
+            f"{claude_query.DEFAULT_BEDROCK_READ_TIMEOUT:g} seconds."
+        ),
+    )
+    parser.add_argument(
         "--mcp-url",
         default=DEFAULT_MCP_URL,
         help=f"MCP server URL. Defaults to {DEFAULT_MCP_URL}.",
@@ -240,6 +260,16 @@ def parse_args() -> argparse.Namespace:
         action="append",
         metavar="KEY=VALUE",
         help="Optional HTTP header to send to the MCP server. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--mcp-read-timeout",
+        type=float,
+        default=claude_query.DEFAULT_MCP_READ_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            "MCP tool-call timeout for --provider claude. Defaults to "
+            f"{claude_query.DEFAULT_MCP_READ_TIMEOUT:g} seconds."
+        ),
     )
     parser.add_argument(
         "--disable-langfuse",
@@ -1148,6 +1178,7 @@ def run_provider_response(
             mcp_url=args.mcp_url,
             requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
             mcp_headers=mcp_headers,
+            mcp_read_timeout=args.mcp_read_timeout,
         )
         if thinking_note:
             print(thinking_note, file=sys.stderr)
