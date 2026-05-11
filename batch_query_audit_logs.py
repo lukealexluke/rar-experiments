@@ -149,7 +149,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Retry only items whose previous detailed JSONL status was not ok, or whose "
-            "CSV ai_id/ai_num fields are blank or incomplete. Requires --retry-from."
+            "CSV ai_id/ai_num fields are blank or incomplete. When --retry-from is "
+            "omitted, the script reads --output-log or the provider's default CSV."
         ),
     )
     parser.add_argument(
@@ -708,6 +709,8 @@ def resolve_retry_manifest_path(
 ) -> Path | None:
     if args.retry_from is not None:
         return args.retry_from
+    if args.retry_failed_only:
+        return (args.output_log or (logs_dir / provider_runtime.default_output_log_name)).resolve()
     return None
 
 
@@ -1187,13 +1190,6 @@ def main() -> int:
     if args.max_items is not None and args.max_items <= 0:
         print("Error: max-items must be positive when provided.", file=sys.stderr)
         return 1
-    if args.retry_failed_only and args.retry_from is None:
-        print(
-            "Error: --retry-failed-only requires --retry-from with a JSONL or CSV retry manifest.",
-            file=sys.stderr,
-        )
-        return 1
-
     search_root = (args.search_root or logs_dir.parent).resolve()
     retry_manifest_path = resolve_retry_manifest_path(args, logs_dir, provider_runtime)
     retry_manifest: RetryManifest | None = None
