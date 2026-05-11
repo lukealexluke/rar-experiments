@@ -33,6 +33,8 @@ DEFAULT_ALLOWED_MCP_TOOLS = ("theorem_search",)
 DEFAULT_APPROVAL_LIMIT = 8
 DEFAULT_DOTENV_FILENAME = ".env"
 DEFAULT_BODY_CONTEXT_LINES = 20
+DEFAULT_RETRIEVAL_MODE = "mcp"
+RETRIEVAL_MODES = ("mcp", "web-search", "none")
 DEFAULT_LANGFUSE_TRACE_NAME = "tex-bib-mcp-query"
 DEFAULT_LANGFUSE_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 DEFAULT_LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
@@ -145,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Upload a .tex file and a bibliography source to the OpenAI Responses API, "
-            "and let the model use the TheoremSearch MCP server."
+            "and let the model use a selected external retrieval mode."
         )
     )
     parser.add_argument("tex_file", type=Path, help="Path to the LaTeX source file.")
@@ -190,6 +192,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "The question or instruction to send with the uploaded files. "
             "If omitted, the script uses a default paper-analysis prompt."
+        ),
+    )
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=RETRIEVAL_MODES,
+        default=DEFAULT_RETRIEVAL_MODE,
+        help=(
+            "External retrieval mode: mcp uses TheoremSearch, web-search uses the "
+            "provider's web search tool, and none disables external retrieval. "
+            f"Defaults to {DEFAULT_RETRIEVAL_MODE}."
         ),
     )
     parser.add_argument(
@@ -1006,6 +1018,7 @@ def main() -> int:
                     mcp_url=args.mcp_url,
                     mcp_label=args.mcp_label,
                     mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                    retrieval_mode=args.retrieval_mode,
                 ),
                 metadata=build_langfuse_observation_metadata(
                     tex_path=tex_path,
@@ -1013,6 +1026,7 @@ def main() -> int:
                     mcp_url=args.mcp_url,
                     mcp_label=args.mcp_label,
                     mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                    retrieval_mode=args.retrieval_mode,
                 ),
             )
             if langfuse_runtime.enabled
@@ -1029,6 +1043,7 @@ def main() -> int:
                         tex_path=tex_path,
                         bib_path=bib_path,
                         model=args.model,
+                        retrieval_mode=args.retrieval_mode,
                     ),
                 )
                 if langfuse_runtime.enabled and langfuse_runtime.propagate_attributes
@@ -1055,6 +1070,7 @@ def main() -> int:
                             mcp_url=args.mcp_url,
                             mcp_label=args.mcp_label,
                             mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                            retrieval_mode=args.retrieval_mode,
                         ),
                         metadata=build_langfuse_generation_metadata(
                             tex_path=tex_path,
@@ -1063,6 +1079,7 @@ def main() -> int:
                             mcp_label=args.mcp_label,
                             mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
                             pricing=pricing,
+                            retrieval_mode=args.retrieval_mode,
                         ),
                         model=args.model,
                         model_parameters=build_langfuse_model_parameters(args),
@@ -1081,15 +1098,21 @@ def main() -> int:
                             bib_path=upload_inputs.bib_path,
                             user_prompt=args.prompt,
                             context_note=upload_inputs.prompt_note,
+                            retrieval_mode=args.retrieval_mode,
                         ),
                         tex_upload_id=required_file_id(tex_upload, upload_inputs.tex_path),
                         bib_upload_id=required_file_id(bib_upload, upload_inputs.bib_path),
-                        mcp_tool=build_mcp_tool(
-                            mcp_label=args.mcp_label,
-                            mcp_url=args.mcp_url,
-                            mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
-                            mcp_headers=mcp_headers,
+                        mcp_tool=(
+                            build_mcp_tool(
+                                mcp_label=args.mcp_label,
+                                mcp_url=args.mcp_url,
+                                mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                                mcp_headers=mcp_headers,
+                            )
+                            if args.retrieval_mode == "mcp"
+                            else None
                         ),
+                        retrieval_mode=args.retrieval_mode,
                     )
 
                     output_text = extract_output_text(response, response_data)
@@ -1295,13 +1318,14 @@ def build_user_prompt(
     bib_path: Path,
     user_prompt: str | None,
     context_note: str | None = None,
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ) -> str:
+    retrieval_instruction = build_retrieval_instruction(retrieval_mode)
     instruction = user_prompt.strip() if user_prompt else (
         "Read the attached LaTeX source and bibliography, identify the missing "
         "citation, and return JSON only with exactly these keys: "
         '{"ai_id": <external arXiv identifier or null>, '
-        '"ai_num": <cited theorem-like result name/number or null>}. '
-        "Use theorem_search when it would improve factual or literature-grounded answers."
+        '"ai_num": <cited theorem-like result name/number or null>}.'
     )
     context_block = f"{context_note.strip()}\n\n" if context_note and context_note.strip() else ""
     return (
@@ -1310,18 +1334,46 @@ def build_user_prompt(
         f"- {bib_path.name}: the bibliography file\n\n"
         "Treat the uploaded files as the primary project context.\n"
         f"{context_block}"
-        "Your job is to search the database for citations via the search tool. You can call it through the attached MCP server.\n\n"
+        f"{retrieval_instruction}\n\n"
         "User request:\n"
         f"{instruction}"
     )
 
 
-def build_system_prompt() -> str:
+def build_retrieval_instruction(retrieval_mode: str) -> str:
+    if retrieval_mode == "mcp":
+        return (
+            "Your job is to search the database for citations via the search tool. "
+            "You can call it through the attached MCP server. Use theorem_search "
+            "when it would improve factual or literature-grounded answers."
+        )
+    if retrieval_mode == "web-search":
+        return (
+            "Use web search when it would improve factual or literature-grounded "
+            "answers. Do not use TheoremSearch or MCP tools in this mode."
+        )
     return (
-        "You do not have access to web search in this session. "
-        "The only external tool available is the attached MCP server, "
-        "and the only allowed MCP tool is theorem_search. "
-        "If you need external retrieval, use theorem_search only."
+        "Do not use external retrieval tools. Answer only from the attached files "
+        "and your model knowledge."
+    )
+
+
+def build_system_prompt(retrieval_mode: str = DEFAULT_RETRIEVAL_MODE) -> str:
+    if retrieval_mode == "mcp":
+        return (
+            "You do not have access to web search in this session. "
+            "The only external tool available is the attached MCP server, "
+            "and the only allowed MCP tool is theorem_search. "
+            "If you need external retrieval, use theorem_search only."
+        )
+    if retrieval_mode == "web-search":
+        return (
+            "You may use the provider web search tool for external retrieval. "
+            "Do not use MCP or TheoremSearch tools in this session."
+        )
+    return (
+        "You do not have access to external retrieval tools in this session. "
+        "Use only the attached files and your model knowledge."
     )
 
 
@@ -1334,6 +1386,7 @@ def build_langfuse_observation_input(
     mcp_url: str,
     mcp_label: str,
     mcp_tools: list[str],
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ) -> dict[str, Any]:
     return {
         "tex_file": str(tex_path),
@@ -1341,7 +1394,8 @@ def build_langfuse_observation_input(
         "user_prompt": user_prompt or "(default prompt)",
         "model": model,
         "reasoning_effort": reasoning_effort,
-        "web_search_enabled": False,
+        "retrieval_mode": retrieval_mode,
+        "web_search_enabled": retrieval_mode == "web-search",
         "mcp": {
             "label": mcp_label,
             "url": mcp_url,
@@ -1356,13 +1410,15 @@ def build_langfuse_observation_metadata(
     mcp_url: str,
     mcp_label: str,
     mcp_tools: list[str],
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ) -> dict[str, Any]:
     return {
         "tex_filename": tex_path.name,
         "bib_filename": bib_path.name,
         "tool_policy": {
-            "web_search_enabled": False,
-            "mcp_only": True,
+            "retrieval_mode": retrieval_mode,
+            "web_search_enabled": retrieval_mode == "web-search",
+            "mcp_enabled": retrieval_mode == "mcp",
         },
         "mcp": {
             "label": mcp_label,
@@ -1376,13 +1432,15 @@ def build_langfuse_trace_metadata(
     tex_path: Path,
     bib_path: Path,
     model: str,
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ) -> dict[str, str]:
     return {
         "tex_file": tex_path.name,
         "bib_file": bib_path.name,
         "model": model,
-        "web_search": "disabled",
-        "external_tool": "theorem_search",
+        "retrieval_mode": retrieval_mode,
+        "web_search": "enabled" if retrieval_mode == "web-search" else "disabled",
+        "external_tool": "theorem_search" if retrieval_mode == "mcp" else retrieval_mode,
     }
 
 
@@ -1403,10 +1461,11 @@ def build_langfuse_observation_output(
 
 
 def build_langfuse_model_parameters(args: argparse.Namespace) -> dict[str, Any]:
+    retrieval_mode = getattr(args, "retrieval_mode", DEFAULT_RETRIEVAL_MODE)
     return {
         "reasoning_effort": args.reasoning_effort,
         "max_output_tokens": args.max_output_tokens,
-        "tool_mode": "mcp_only",
+        "tool_mode": retrieval_mode,
     }
 
 
@@ -1417,13 +1476,15 @@ def build_langfuse_generation_input(
     mcp_url: str,
     mcp_label: str,
     mcp_tools: list[str],
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ) -> dict[str, Any]:
     return {
         "tex_file": str(tex_path),
         "bib_file": str(bib_path),
         "user_prompt": user_prompt or "(default prompt)",
         "tools": {
-            "web_search_enabled": False,
+            "retrieval_mode": retrieval_mode,
+            "web_search_enabled": retrieval_mode == "web-search",
             "mcp_label": mcp_label,
             "mcp_url": mcp_url,
             "allowed_tools": mcp_tools,
@@ -1438,13 +1499,15 @@ def build_langfuse_generation_metadata(
     mcp_label: str,
     mcp_tools: list[str],
     pricing: ModelPricing | None,
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "tex_filename": tex_path.name,
         "bib_filename": bib_path.name,
         "tool_policy": {
-            "web_search_enabled": False,
-            "mcp_only": True,
+            "retrieval_mode": retrieval_mode,
+            "web_search_enabled": retrieval_mode == "web-search",
+            "mcp_enabled": retrieval_mode == "mcp",
         },
         "mcp": {
             "label": mcp_label,
@@ -1655,6 +1718,26 @@ def build_mcp_tool(
     return tool
 
 
+def build_web_search_tool() -> dict[str, Any]:
+    return {
+        "type": "web_search",
+    }
+
+
+def build_openai_tools(
+    *,
+    retrieval_mode: str,
+    mcp_tool: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if retrieval_mode == "mcp":
+        if mcp_tool is None:
+            raise RuntimeError("retrieval-mode=mcp requires an MCP tool configuration.")
+        return [mcp_tool]
+    if retrieval_mode == "web-search":
+        return [build_web_search_tool()]
+    return []
+
+
 def run_response(
     client,
     model: str,
@@ -1663,20 +1746,21 @@ def run_response(
     prompt: str,
     tex_upload_id: str,
     bib_upload_id: str,
-    mcp_tool: dict[str, Any],
+    mcp_tool: dict[str, Any] | None,
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ):
-    response = client.responses.create(
-        model=model,
-        reasoning={"effort": reasoning_effort},
-        max_output_tokens=max_output_tokens,
-        tools=[mcp_tool],
-        input=[
+    tools = build_openai_tools(retrieval_mode=retrieval_mode, mcp_tool=mcp_tool)
+    request: dict[str, Any] = {
+        "model": model,
+        "reasoning": {"effort": reasoning_effort},
+        "max_output_tokens": max_output_tokens,
+        "input": [
             {
                 "role": "system",
                 "content": [
                     {
                         "type": "input_text",
-                        "text": build_system_prompt(),
+                        "text": build_system_prompt(retrieval_mode),
                     }
                 ],
             },
@@ -1695,11 +1779,14 @@ def run_response(
                 ],
             }
         ],
-    )
+    }
+    if tools:
+        request["tools"] = tools
+    response = client.responses.create(**request)
 
     response_data = to_dict(response)
     previous_response_id = response_data.get("id")
-    if not previous_response_id:
+    if retrieval_mode != "mcp" or not previous_response_id:
         return response, response_data
 
     for _ in range(DEFAULT_APPROVAL_LIMIT):
@@ -1707,13 +1794,13 @@ def run_response(
         if not approval_requests:
             return response, response_data
 
-        response = client.responses.create(
-            model=model,
-            reasoning={"effort": reasoning_effort},
-            max_output_tokens=max_output_tokens,
-            tools=[mcp_tool],
-            previous_response_id=previous_response_id,
-            input=[
+        followup_request: dict[str, Any] = {
+            "model": model,
+            "reasoning": {"effort": reasoning_effort},
+            "max_output_tokens": max_output_tokens,
+            "tools": tools,
+            "previous_response_id": previous_response_id,
+            "input": [
                 {
                     "type": "mcp_approval_response",
                     "approval_request_id": request["id"],
@@ -1722,7 +1809,8 @@ def run_response(
                 }
                 for request in approval_requests
             ],
-        )
+        }
+        response = client.responses.create(**followup_request)
         response_data = to_dict(response)
         previous_response_id = response_data.get("id", previous_response_id)
 

@@ -20,6 +20,8 @@ from query_openai_tex_mcp import (
     DEFAULT_LANGFUSE_TRACE_NAME,
     DEFAULT_MCP_LABEL,
     DEFAULT_MCP_URL,
+    DEFAULT_RETRIEVAL_MODE,
+    RETRIEVAL_MODES,
     build_langfuse_generation_result_metadata,
     build_langfuse_model_parameters,
     compute_langfuse_cost_details,
@@ -170,6 +172,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--retrieval-mode",
+        choices=RETRIEVAL_MODES,
+        default=DEFAULT_RETRIEVAL_MODE,
+        help=(
+            "External retrieval mode: mcp uses TheoremSearch, web-search uses the "
+            "provider's native web search when available, and none disables external "
+            f"retrieval. Defaults to {DEFAULT_RETRIEVAL_MODE}."
+        ),
+    )
+    parser.add_argument(
         "--tex-context-lines",
         "--body-context-lines",
         "--context-lines",
@@ -267,7 +279,7 @@ def parse_args() -> argparse.Namespace:
         default=claude_query.DEFAULT_MCP_READ_TIMEOUT,
         metavar="SECONDS",
         help=(
-            "MCP tool-call timeout for --provider claude. Defaults to "
+            "MCP tool-call timeout where supported. Defaults to "
             f"{claude_query.DEFAULT_MCP_READ_TIMEOUT:g} seconds."
         ),
     )
@@ -460,16 +472,22 @@ def build_item_prompt(
     line_number: int,
     user_prompt: str | None,
     body_context_lines: int,
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ) -> str:
+    retrieval_instruction = openai_query.build_retrieval_instruction(retrieval_mode)
     default_instruction = (
         "Task:\n"
         "1. Identify the external arXiv identifier of the cited source paper containing the missing result.\n"
         '2. Identify the cited theorem-like result name/number, for example "Theorem 1.2" or "Proposition 3.4".\n'
-        "Use theorem_search if it helps.\n\n"
+        f"{retrieval_instruction}\n\n"
         "Return JSON only, with exactly this shape:\n"
         '{"ai_id": <string or null>, "ai_num": <string or null>}'
     )
-    instruction = user_prompt.strip() if user_prompt else default_instruction
+    instruction = (
+        f"{user_prompt.strip()}\n\n{retrieval_instruction}"
+        if user_prompt
+        else default_instruction
+    )
     return (
         "Analyze one logged theorem-style citation occurrence in the attached LaTeX source and bibliography.\n\n"
         f"Log file: {log_name}\n"
@@ -974,6 +992,7 @@ def build_langfuse_batch_span_input(
     mcp_url: str,
     mcp_label: str,
     mcp_tools: list[str],
+    retrieval_mode: str,
 ) -> dict[str, Any]:
     return {
         "provider": provider_name,
@@ -986,6 +1005,7 @@ def build_langfuse_batch_span_input(
         "model": model,
         "reasoning_effort": reasoning_effort,
         "max_output_tokens": max_output_tokens,
+        "retrieval_mode": retrieval_mode,
         "mcp": {
             "label": mcp_label,
             "url": mcp_url,
@@ -1000,6 +1020,7 @@ def build_langfuse_batch_span_metadata(
     record_index: int,
     line_number: int,
     output_log: Path,
+    retrieval_mode: str,
 ) -> dict[str, Any]:
     return {
         "provider": provider_name,
@@ -1008,8 +1029,9 @@ def build_langfuse_batch_span_metadata(
         "line_number": line_number,
         "output_log": str(output_log),
         "tool_policy": {
-            "web_search_enabled": False,
-            "mcp_only": True,
+            "retrieval_mode": retrieval_mode,
+            "web_search_enabled": retrieval_mode == "web-search",
+            "mcp_enabled": retrieval_mode == "mcp",
         },
     }
 
@@ -1148,11 +1170,15 @@ def run_provider_response(
     mcp_headers: dict[str, str],
 ):
     if provider_runtime.name == "openai":
-        mcp_tool = provider_runtime.module.build_mcp_tool(
-            mcp_label=args.mcp_label,
-            mcp_url=args.mcp_url,
-            mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
-            mcp_headers=mcp_headers,
+        mcp_tool = (
+            provider_runtime.module.build_mcp_tool(
+                mcp_label=args.mcp_label,
+                mcp_url=args.mcp_url,
+                mcp_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+                mcp_headers=mcp_headers,
+            )
+            if args.retrieval_mode == "mcp"
+            else None
         )
         return provider_runtime.module.run_response(
             client=client,
@@ -1163,6 +1189,7 @@ def run_provider_response(
             tex_upload_id=provider_runtime.module.required_file_id(tex_upload, tex_upload_path),
             bib_upload_id=provider_runtime.module.required_file_id(bib_upload, bib_upload_path),
             mcp_tool=mcp_tool,
+            retrieval_mode=args.retrieval_mode,
         )
 
     if provider_runtime.name == "gemini":
@@ -1178,28 +1205,40 @@ def run_provider_response(
             mcp_url=args.mcp_url,
             requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
             mcp_headers=mcp_headers,
+            retrieval_mode=args.retrieval_mode,
             mcp_read_timeout=args.mcp_read_timeout,
         )
         if thinking_note:
             print(thinking_note, file=sys.stderr)
         requested_tools = args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS)
-        if available_tool_names == requested_tools:
-            print(
-                "MCP session tools: " + ", ".join(available_tool_names) + ".",
-                file=sys.stderr,
-            )
+        if args.retrieval_mode == "mcp":
+            if available_tool_names == requested_tools:
+                print(
+                    "MCP session tools: " + ", ".join(available_tool_names) + ".",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Requested MCP tools: "
+                    + ", ".join(requested_tools)
+                    + "; MCP session exposes: "
+                    + ", ".join(available_tool_names)
+                    + " (Gemini SDK MCP sessions do not enforce client-side tool allowlists).",
+                    file=sys.stderr,
+                )
+        elif args.retrieval_mode == "web-search":
+            print("Gemini retrieval tools: google_search.", file=sys.stderr)
         else:
-            print(
-                "Requested MCP tools: "
-                + ", ".join(requested_tools)
-                + "; MCP session exposes: "
-                + ", ".join(available_tool_names)
-                + " (Gemini SDK MCP sessions do not enforce client-side tool allowlists).",
-                file=sys.stderr,
-            )
+            print("External retrieval disabled.", file=sys.stderr)
         return response, response_data
 
     if provider_runtime.name == "claude":
+        if args.retrieval_mode != "mcp":
+            raise RuntimeError(
+                "Claude Bedrock in this script currently supports retrieval-mode=mcp only. "
+                "Use provider=openai or provider=gemini for native web search, or "
+                "use --retrieval-mode mcp for Claude."
+            )
         response, response_data, available_tool_names, thinking_note = provider_runtime.module.run_response(
             client=client,
             model=args.model,
@@ -1231,6 +1270,14 @@ def main() -> int:
     args = normalize_cli_path_args(args)
     provider_runtime = resolve_provider_runtime(args.provider)
     args = apply_provider_defaults(args, provider_runtime)
+    if provider_runtime.name == "claude" and args.retrieval_mode != "mcp":
+        print(
+            "Error: Claude Bedrock in this script currently supports "
+            "retrieval-mode=mcp only. Use --provider openai or --provider gemini "
+            "for native web search.",
+            file=sys.stderr,
+        )
+        return 1
 
     try:
         logs_dir = resolve_logs_dir(args.logs_dir)
@@ -1438,6 +1485,7 @@ def main() -> int:
                         line_number=record.line_number,
                         user_prompt=args.prompt,
                         body_context_lines=args.body_context_lines,
+                        retrieval_mode=args.retrieval_mode,
                     )
 
                     trace_context = (
@@ -1458,6 +1506,7 @@ def main() -> int:
                                 mcp_url=args.mcp_url,
                                 mcp_label=args.mcp_label,
                                 mcp_tools=mcp_tools,
+                                retrieval_mode=args.retrieval_mode,
                             ),
                             metadata=build_langfuse_batch_span_metadata(
                                 provider_name=provider_runtime.name,
@@ -1465,6 +1514,7 @@ def main() -> int:
                                 record_index=record.record_index,
                                 line_number=record.line_number,
                                 output_log=output_log,
+                                retrieval_mode=args.retrieval_mode,
                             ),
                         )
                         if langfuse_runtime.enabled
@@ -1482,6 +1532,7 @@ def main() -> int:
                                     "log_file": str(log_path),
                                     "record_index": str(record.record_index),
                                     "line_number": str(record.line_number),
+                                    "retrieval_mode": args.retrieval_mode,
                                 },
                             )
                             if langfuse_runtime.enabled and langfuse_runtime.propagate_attributes
@@ -1502,7 +1553,8 @@ def main() -> int:
                                         "bib_file": str(upload_inputs.bib_path),
                                         "user_prompt": prompt,
                                         "tools": {
-                                            "web_search_enabled": False,
+                                            "retrieval_mode": args.retrieval_mode,
+                                            "web_search_enabled": args.retrieval_mode == "web-search",
                                             "mcp_label": args.mcp_label,
                                             "mcp_url": args.mcp_url,
                                             "allowed_tools": mcp_tools,
@@ -1517,8 +1569,9 @@ def main() -> int:
                                         "tex_filename": upload_inputs.tex_path.name,
                                         "bib_filename": upload_inputs.bib_path.name,
                                         "tool_policy": {
-                                            "web_search_enabled": False,
-                                            "mcp_only": True,
+                                            "retrieval_mode": args.retrieval_mode,
+                                            "web_search_enabled": args.retrieval_mode == "web-search",
+                                            "mcp_enabled": args.retrieval_mode == "mcp",
                                         },
                                     },
                                     model=args.model,

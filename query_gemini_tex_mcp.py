@@ -20,7 +20,9 @@ from query_openai_tex_mcp import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MCP_LABEL,
     DEFAULT_MCP_URL,
+    DEFAULT_RETRIEVAL_MODE,
     ModelPricing,
+    RETRIEVAL_MODES,
     build_langfuse_generation_input,
     build_langfuse_generation_metadata,
     build_langfuse_generation_output,
@@ -98,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Upload a .tex file and a bibliography source to the Gemini API, "
-            "and let the model use the TheoremSearch MCP server."
+            "and let the model use a selected external retrieval mode."
         )
     )
     parser.add_argument("tex_file", type=Path, help="Path to the LaTeX source file.")
@@ -143,6 +145,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "The question or instruction to send with the uploaded files. "
             "If omitted, the script uses a default paper-analysis prompt."
+        ),
+    )
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=RETRIEVAL_MODES,
+        default=DEFAULT_RETRIEVAL_MODE,
+        help=(
+            "External retrieval mode: mcp uses TheoremSearch, web-search uses "
+            "Gemini Google Search grounding, and none disables external retrieval. "
+            f"Defaults to {DEFAULT_RETRIEVAL_MODE}."
         ),
     )
     parser.add_argument(
@@ -469,6 +481,8 @@ def run_response(
     mcp_url: str,
     requested_tools: list[str],
     mcp_headers: dict[str, str],
+    retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
+    mcp_read_timeout: float | None = None,
 ):
     return asyncio.run(
         _run_response_async(
@@ -483,6 +497,8 @@ def run_response(
             mcp_url=mcp_url,
             requested_tools=requested_tools,
             mcp_headers=mcp_headers,
+            retrieval_mode=retrieval_mode,
+            mcp_read_timeout=mcp_read_timeout,
         )
     )
 
@@ -499,25 +515,80 @@ async def _run_response_async(
     mcp_url: str,
     requested_tools: list[str],
     mcp_headers: dict[str, str],
+    retrieval_mode: str,
+    mcp_read_timeout: float | None,
 ):
     try:
-        import httpx
         from google import genai
         from google.genai import types
-        from mcp import ClientSession
-        from mcp.client.streamable_http import streamable_http_client
     except ImportError as exc:
         raise RuntimeError(
-            "Missing Gemini runtime dependency. Install `google-genai` and `mcp`."
+            "Missing Gemini runtime dependency. Install `google-genai`."
         ) from exc
 
     thinking_config, thinking_note = build_thinking_config(model, reasoning_effort)
-    http_client = httpx.AsyncClient(
-        headers=mcp_headers or None,
-        follow_redirects=True,
-    )
     async_client = genai.Client(api_key=client.api_key).aio
     try:
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": build_system_prompt(retrieval_mode),
+            "max_output_tokens": max_output_tokens,
+            "thinking_config": thinking_config,
+        }
+        if retrieval_mode == "web-search":
+            try:
+                config_kwargs["tools"] = [
+                    types.Tool(google_search=types.GoogleSearch())
+                ]
+            except AttributeError as exc:
+                raise RuntimeError(
+                    "Installed google-genai does not support Google Search grounding. "
+                    "Upgrade `google-genai` or use --retrieval-mode mcp."
+                ) from exc
+            config = types.GenerateContentConfig(**config_kwargs)
+            response = await async_client.models.generate_content(
+                model=model,
+                contents=[prompt, tex_upload, bib_upload],
+                config=config,
+            )
+            return response, to_dict(response), ["google_search"], thinking_note
+
+        if retrieval_mode == "none":
+            config = types.GenerateContentConfig(**config_kwargs)
+            response = await async_client.models.generate_content(
+                model=model,
+                contents=[prompt, tex_upload, bib_upload],
+                config=config,
+            )
+            return response, to_dict(response), [], thinking_note
+
+        try:
+            import httpx
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamable_http_client
+        except ImportError as exc:
+            raise RuntimeError(
+                "Missing MCP runtime dependency. Install `mcp` and `httpx`, "
+                "or use --retrieval-mode web-search/none."
+            ) from exc
+
+        timeout = (
+            httpx.Timeout(
+                connect=30.0,
+                read=mcp_read_timeout if mcp_read_timeout and mcp_read_timeout > 0 else None,
+                write=30.0,
+                pool=30.0,
+            )
+            if mcp_read_timeout is not None
+            else None
+        )
+        http_client_kwargs: dict[str, Any] = {
+            "headers": mcp_headers or None,
+            "follow_redirects": True,
+        }
+        if timeout is not None:
+            http_client_kwargs["timeout"] = timeout
+
+        http_client = httpx.AsyncClient(**http_client_kwargs)
         async with http_client:
             async with streamable_http_client(
                 mcp_url,
@@ -532,12 +603,8 @@ async def _run_response_async(
                         for tool in getattr(list_tools_result, "tools", [])
                         if getattr(tool, "name", "")
                     ]
-                    config = types.GenerateContentConfig(
-                        system_instruction=build_system_prompt(),
-                        max_output_tokens=max_output_tokens,
-                        thinking_config=thinking_config,
-                        tools=[session],
-                    )
+                    config_kwargs["tools"] = [session]
+                    config = types.GenerateContentConfig(**config_kwargs)
                     response = await async_client.models.generate_content(
                         model=model,
                         contents=[prompt, tex_upload, bib_upload],
@@ -719,6 +786,7 @@ def main() -> int:
                     mcp_url=args.mcp_url,
                     mcp_label=args.mcp_label,
                     mcp_tools=mcp_tools,
+                    retrieval_mode=args.retrieval_mode,
                 ),
                 metadata=build_langfuse_observation_metadata(
                     tex_path=tex_path,
@@ -726,6 +794,7 @@ def main() -> int:
                     mcp_url=args.mcp_url,
                     mcp_label=args.mcp_label,
                     mcp_tools=mcp_tools,
+                    retrieval_mode=args.retrieval_mode,
                 ),
             )
             if langfuse_runtime.enabled
@@ -742,6 +811,7 @@ def main() -> int:
                         tex_path=tex_path,
                         bib_path=bib_path,
                         model=args.model,
+                        retrieval_mode=args.retrieval_mode,
                     ),
                 )
                 if langfuse_runtime.enabled and langfuse_runtime.propagate_attributes
@@ -768,6 +838,7 @@ def main() -> int:
                             mcp_url=args.mcp_url,
                             mcp_label=args.mcp_label,
                             mcp_tools=mcp_tools,
+                            retrieval_mode=args.retrieval_mode,
                         ),
                         metadata=build_langfuse_generation_metadata(
                             tex_path=tex_path,
@@ -776,6 +847,7 @@ def main() -> int:
                             mcp_label=args.mcp_label,
                             mcp_tools=mcp_tools,
                             pricing=pricing,
+                            retrieval_mode=args.retrieval_mode,
                         ),
                         model=args.model,
                         model_parameters=build_langfuse_model_parameters(args),
@@ -794,6 +866,7 @@ def main() -> int:
                             bib_path=upload_inputs.bib_path,
                             user_prompt=args.prompt,
                             context_note=upload_inputs.prompt_note,
+                            retrieval_mode=args.retrieval_mode,
                         ),
                         tex_upload=tex_upload,
                         bib_upload=bib_upload,
@@ -801,23 +874,29 @@ def main() -> int:
                         mcp_url=args.mcp_url,
                         requested_tools=mcp_tools,
                         mcp_headers=mcp_headers,
+                        retrieval_mode=args.retrieval_mode,
                     )
                     if thinking_note:
                         print(thinking_note, file=sys.stderr)
-                    if available_tool_names == mcp_tools:
-                        print(
-                            "MCP session tools: " + ", ".join(available_tool_names) + ".",
-                            file=sys.stderr,
-                        )
+                    if args.retrieval_mode == "mcp":
+                        if available_tool_names == mcp_tools:
+                            print(
+                                "MCP session tools: " + ", ".join(available_tool_names) + ".",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                "Requested MCP tools: "
+                                + ", ".join(mcp_tools)
+                                + "; MCP session exposes: "
+                                + ", ".join(available_tool_names)
+                                + " (Gemini SDK MCP sessions do not enforce client-side tool allowlists).",
+                                file=sys.stderr,
+                            )
+                    elif args.retrieval_mode == "web-search":
+                        print("Gemini retrieval tools: google_search.", file=sys.stderr)
                     else:
-                        print(
-                            "Requested MCP tools: "
-                            + ", ".join(mcp_tools)
-                            + "; MCP session exposes: "
-                            + ", ".join(available_tool_names)
-                            + " (Gemini SDK MCP sessions do not enforce client-side tool allowlists).",
-                            file=sys.stderr,
-                        )
+                        print("External retrieval disabled.", file=sys.stderr)
 
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
