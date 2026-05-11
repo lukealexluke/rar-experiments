@@ -635,7 +635,12 @@ def converse(
     }
     if additional_model_request_fields:
         request["additionalModelRequestFields"] = additional_model_request_fields
-    return client.runtime_client.converse(**request)
+    try:
+        return client.runtime_client.converse(**request)
+    except Exception as exc:
+        raise RuntimeError(
+            "Bedrock Converse operation failed: " + format_exception_message(exc)
+        ) from exc
 
 
 def normalize_bedrock_response(response: dict[str, Any]) -> dict[str, Any]:
@@ -775,18 +780,37 @@ def to_dict(response) -> dict[str, Any]:
     raise RuntimeError("Could not convert the Bedrock response object to a dictionary.")
 
 
-def format_exception_message(exc: BaseException) -> str:
+def format_exception_message(exc: BaseException, seen: set[int] | None = None) -> str:
+    if seen is None:
+        seen = set()
+    exc_id = id(exc)
+    if exc_id in seen:
+        return ""
+    seen.add(exc_id)
+
     child_exceptions = getattr(exc, "exceptions", None)
     if isinstance(child_exceptions, tuple) and child_exceptions:
         child_messages = [
-            format_exception_message(child)
+            format_exception_message(child, seen)
             for child in child_exceptions
             if child is not None
         ]
         child_messages = [message for message in child_messages if message]
         if child_messages:
             return "; ".join(child_messages)
-    return str(exc)
+
+    message = str(exc).strip()
+    class_name = exc.__class__.__name__
+    rendered = f"{class_name}: {message}" if message else class_name
+
+    cause = getattr(exc, "__cause__", None)
+    if cause is None and not getattr(exc, "__suppress_context__", False):
+        cause = getattr(exc, "__context__", None)
+    if cause is not None:
+        cause_message = format_exception_message(cause, seen)
+        if cause_message and cause_message != rendered:
+            return f"{rendered}; caused by {cause_message}"
+    return rendered
 
 
 def main() -> int:

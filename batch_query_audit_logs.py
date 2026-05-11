@@ -889,18 +889,37 @@ def lookup_retry_manifest_row(
     return None
 
 
-def format_exception_message(exc: BaseException) -> str:
+def format_exception_message(exc: BaseException, seen: set[int] | None = None) -> str:
+    if seen is None:
+        seen = set()
+    exc_id = id(exc)
+    if exc_id in seen:
+        return ""
+    seen.add(exc_id)
+
     child_exceptions = getattr(exc, "exceptions", None)
     if isinstance(child_exceptions, tuple) and child_exceptions:
         child_messages = [
-            format_exception_message(child)
+            format_exception_message(child, seen)
             for child in child_exceptions
             if child is not None
         ]
         child_messages = [message for message in child_messages if message]
         if child_messages:
             return "; ".join(child_messages)
-    return str(exc)
+
+    message = str(exc).strip()
+    class_name = exc.__class__.__name__
+    rendered = f"{class_name}: {message}" if message else class_name
+
+    cause = getattr(exc, "__cause__", None)
+    if cause is None and not getattr(exc, "__suppress_context__", False):
+        cause = getattr(exc, "__context__", None)
+    if cause is not None:
+        cause_message = format_exception_message(cause, seen)
+        if cause_message and cause_message != rendered:
+            return f"{rendered}; caused by {cause_message}"
+    return rendered
 
 
 def make_raw_response_path(
