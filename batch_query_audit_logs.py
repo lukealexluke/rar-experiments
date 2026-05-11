@@ -11,6 +11,7 @@ import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+import query_claude_bedrock_tex_mcp as claude_query
 import query_gemini_tex_mcp as gemini_query
 import query_openai_tex_mcp as openai_query
 from query_openai_tex_mcp import (
@@ -70,6 +71,14 @@ PROVIDER_RUNTIMES: dict[str, ProviderRuntime] = {
         default_output_log_name="gemini_query_results.csv",
         default_raw_response_dir_name="raw_gemini_responses",
     ),
+    "claude": ProviderRuntime(
+        name="claude",
+        label="Claude Bedrock",
+        module=claude_query,
+        generation_observation_name="bedrock-runtime.converse",
+        default_output_log_name="claude_bedrock_query_results.csv",
+        default_raw_response_dir_name="raw_claude_bedrock_responses",
+    ),
 }
 
 
@@ -80,6 +89,7 @@ class RetryManifest:
     selected_count: int
     by_path: dict[tuple[str, int], dict[str, Any]]
     by_name: dict[tuple[str, int], dict[str, Any]]
+    by_baseline: dict[tuple[str, str], list[dict[str, Any]]]
 
 
 @dataclass(frozen=True)
@@ -129,16 +139,17 @@ def parse_args() -> argparse.Namespace:
         "--retry-from",
         type=Path,
         help=(
-            "Existing detailed JSONL results log to use as a retry manifest. When provided, "
-            "only items present in that file are eligible to run."
+            "Existing detailed JSONL results log or four-column CSV results log to use "
+            "as a retry manifest. When provided, only items present in that file are "
+            "eligible to run."
         ),
     )
     parser.add_argument(
         "--retry-failed-only",
         action="store_true",
         help=(
-            "Retry only items whose previous detailed JSONL status was not ok. "
-            "Requires --retry-from."
+            "Retry only items whose previous detailed JSONL status was not ok, or whose "
+            "CSV ai_id/ai_num fields are blank or incomplete. Requires --retry-from."
         ),
     )
     parser.add_argument(
@@ -190,6 +201,21 @@ def parse_args() -> argparse.Namespace:
             "Environment variable containing the provider API key. Defaults to the "
             "selected provider's default value."
         ),
+    )
+    parser.add_argument(
+        "--aws-region",
+        help=(
+            "AWS region for --provider claude. Defaults to AWS_REGION, "
+            "AWS_DEFAULT_REGION, or us-east-1."
+        ),
+    )
+    parser.add_argument(
+        "--aws-profile",
+        help="Optional AWS profile name for --provider claude.",
+    )
+    parser.add_argument(
+        "--bedrock-endpoint-url",
+        help="Optional custom bedrock-runtime endpoint URL for --provider claude.",
     )
     parser.add_argument(
         "--mcp-url",
@@ -541,6 +567,48 @@ def normalize_retry_name_key(value: object) -> str:
     return ""
 
 
+def build_retry_baseline_key(row: dict[str, Any]) -> tuple[str, str] | None:
+    baseline_id = normalize_result_id(row.get("baseline_id"))
+    baseline_num = normalize_optional_string(row.get("baseline_num")).lower()
+    if not baseline_id and not baseline_num:
+        return None
+    return baseline_id, baseline_num
+
+
+def row_has_complete_ai_output(row: dict[str, Any]) -> bool:
+    return bool(
+        normalize_result_id(row.get("ai_id"))
+        and normalize_optional_string(row.get("ai_num"))
+    )
+
+
+def row_has_any_ai_output(row: dict[str, Any]) -> bool:
+    return bool(
+        normalize_result_id(row.get("ai_id"))
+        or normalize_optional_string(row.get("ai_num"))
+    )
+
+
+def replacement_should_update_existing(
+    existing_row: dict[str, Any],
+    replacement_row: dict[str, Any],
+) -> bool:
+    if row_has_complete_ai_output(replacement_row):
+        return True
+    if not row_has_any_ai_output(existing_row):
+        return True
+    if row_has_any_ai_output(replacement_row) and not row_has_complete_ai_output(existing_row):
+        return True
+    return False
+
+
+def retry_manifest_row_is_failed(row: dict[str, Any]) -> bool:
+    previous_status = normalize_optional_string(row.get("status")).lower()
+    if previous_status:
+        return previous_status != "ok"
+    return not row_has_complete_ai_output(row)
+
+
 def load_retry_manifest(
     source_path: Path,
     *,
@@ -555,58 +623,81 @@ def load_retry_manifest(
 
     by_path: dict[tuple[str, int], dict[str, Any]] = {}
     by_name: dict[tuple[str, int], dict[str, Any]] = {}
-    selected_keys: set[tuple[str, int]] = set()
+    by_baseline: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    selected_count = 0
 
-    with resolved_source.open("r", encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError(
-                    f"retry manifest {resolved_source} contains invalid JSON on line "
-                    f"{line_number}: {exc}"
-                ) from exc
-            if not isinstance(row, dict):
-                raise RuntimeError(
-                    f"retry manifest {resolved_source} contains a non-object JSON value "
-                    f"on line {line_number}."
-                )
+    def consider_row(row: dict[str, Any]) -> None:
+        nonlocal selected_count
 
-            row_provider = normalize_optional_string(row.get("provider")).lower()
-            if row_provider and row_provider != provider_name:
-                continue
+        row_provider = normalize_optional_string(row.get("provider")).lower()
+        if row_provider and row_provider != provider_name:
+            return
 
-            record_index = coerce_optional_int(row.get("record_index"))
-            if record_index is None:
-                continue
+        if failed_only and not retry_manifest_row_is_failed(row):
+            return
 
-            previous_status = normalize_optional_string(row.get("status")).lower()
-            if failed_only and previous_status == "ok":
-                continue
+        record_index = coerce_optional_int(row.get("record_index"))
+        path_key = normalize_retry_path_key(row.get("log_file"))
+        name_key = normalize_retry_name_key(row.get("log_file"))
+        baseline_key = build_retry_baseline_key(row)
+        if record_index is None and baseline_key is None:
+            return
 
-            path_key = normalize_retry_path_key(row.get("log_file"))
-            name_key = normalize_retry_name_key(row.get("log_file"))
-            if not path_key and not name_key:
-                continue
-
+        row_selected = False
+        if record_index is not None:
             if path_key:
                 by_path[(path_key, record_index)] = row
-                selected_keys.add((path_key, record_index))
-            elif name_key:
-                selected_keys.add((f"name:{name_key}", record_index))
-
+                row_selected = True
             if name_key:
                 by_name[(name_key, record_index)] = row
+                row_selected = True
+
+        if baseline_key is not None:
+            by_baseline.setdefault(baseline_key, []).append(row)
+            row_selected = True
+
+        if row_selected:
+            selected_count += 1
+
+    if resolved_source.suffix.lower() == ".csv":
+        with resolved_source.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            missing_fields = [
+                field for field in RESULT_CSV_FIELDS if field not in (reader.fieldnames or [])
+            ]
+            if missing_fields:
+                raise RuntimeError(
+                    f"retry CSV is missing required column(s): {', '.join(missing_fields)}"
+                )
+            for row in reader:
+                consider_row(dict(row))
+    else:
+        with resolved_source.open("r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"retry manifest {resolved_source} contains invalid JSON on line "
+                        f"{line_number}: {exc}"
+                    ) from exc
+                if not isinstance(row, dict):
+                    raise RuntimeError(
+                        f"retry manifest {resolved_source} contains a non-object JSON value "
+                        f"on line {line_number}."
+                    )
+                consider_row(row)
 
     return RetryManifest(
         source_path=resolved_source,
         failed_only=failed_only,
-        selected_count=len(selected_keys),
+        selected_count=selected_count,
         by_path=by_path,
         by_name=by_name,
+        by_baseline=by_baseline,
     )
 
 
@@ -719,13 +810,13 @@ def merge_result_log_rows(
     *,
     default_provider: str,
 ) -> MergeOutcome:
-    updated_rows_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    updated_rows_by_key: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     ordered_updated_rows: list[dict[str, Any]] = []
 
     for row in updated_rows:
         ordered_updated_rows.append(row)
         for key in build_result_row_match_keys(row, default_provider=default_provider):
-            updated_rows_by_key[key] = row
+            updated_rows_by_key.setdefault(key, []).append(row)
 
     merged_rows: list[dict[str, Any]] = []
     consumed_update_ids: set[int] = set()
@@ -734,15 +825,21 @@ def merge_result_log_rows(
     for row in existing_rows:
         replacement: dict[str, Any] | None = None
         for key in build_result_row_match_keys(row, default_provider=default_provider):
-            candidate = updated_rows_by_key.get(key)
-            if candidate is not None:
+            for candidate in updated_rows_by_key.get(key, []):
+                if id(candidate) in consumed_update_ids:
+                    continue
                 replacement = candidate
+                break
+            if replacement is not None:
                 break
 
         if replacement is not None and id(replacement) not in consumed_update_ids:
-            merged_rows.append(replacement)
             consumed_update_ids.add(id(replacement))
-            replaced_count += 1
+            if replacement_should_update_existing(row, replacement):
+                merged_rows.append(replacement)
+                replaced_count += 1
+            else:
+                merged_rows.append(row)
         else:
             merged_rows.append(row)
 
@@ -765,6 +862,7 @@ def lookup_retry_manifest_row(
     retry_manifest: RetryManifest,
     log_path: Path,
     record_index: int,
+    record: object | None = None,
 ) -> dict[str, Any] | None:
     path_key = normalize_retry_path_key(str(log_path.resolve()))
     if path_key:
@@ -777,6 +875,13 @@ def lookup_retry_manifest_row(
         row = retry_manifest.by_name.get((name_key, record_index))
         if row is not None:
             return row
+
+    if record is not None:
+        baseline_id, baseline_num = baseline_fields_from_record(record)
+        baseline_key = (baseline_id, baseline_num.lower())
+        rows = retry_manifest.by_baseline.get(baseline_key)
+        if rows:
+            return rows[0]
 
     return None
 
@@ -949,6 +1054,8 @@ def maybe_ensure_provider_dependencies(provider_runtime: ProviderRuntime) -> Non
 
 
 def upload_file_refs(provider_runtime: ProviderRuntime, tex_upload, bib_upload) -> list[str]:
+    if provider_runtime.name == "claude":
+        return []
     ref_attribute = "id" if provider_runtime.name == "openai" else "name"
     return [
         ref
@@ -958,6 +1065,23 @@ def upload_file_refs(provider_runtime: ProviderRuntime, tex_upload, bib_upload) 
         )
         if ref
     ]
+
+
+def make_provider_client(
+    provider_runtime: ProviderRuntime,
+    args: argparse.Namespace,
+    *,
+    enable_langfuse: bool,
+):
+    make_client_from_args = getattr(provider_runtime.module, "make_client_from_args", None)
+    if callable(make_client_from_args):
+        return make_client_from_args(args, enable_langfuse=enable_langfuse)
+
+    api_key = read_api_key(args.api_key_env)
+    return provider_runtime.module.make_client(
+        api_key,
+        enable_langfuse=enable_langfuse,
+    )
 
 
 def run_provider_response(
@@ -1022,6 +1146,30 @@ def run_provider_response(
             )
         return response, response_data
 
+    if provider_runtime.name == "claude":
+        response, response_data, available_tool_names, thinking_note = provider_runtime.module.run_response(
+            client=client,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            max_output_tokens=args.max_output_tokens,
+            prompt=prompt,
+            tex_upload=tex_upload,
+            bib_upload=bib_upload,
+            mcp_label=args.mcp_label,
+            mcp_url=args.mcp_url,
+            requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
+            mcp_headers=mcp_headers,
+        )
+        if thinking_note:
+            print(thinking_note, file=sys.stderr)
+        print(
+            "MCP session tools exposed to Claude: "
+            + ", ".join(available_tool_names)
+            + ".",
+            file=sys.stderr,
+        )
+        return response, response_data
+
     raise RuntimeError(f"Unsupported provider: {provider_runtime.name}")
 
 
@@ -1041,7 +1189,7 @@ def main() -> int:
         return 1
     if args.retry_failed_only and args.retry_from is None:
         print(
-            "Error: --retry-failed-only requires --retry-from with a detailed JSONL retry manifest.",
+            "Error: --retry-failed-only requires --retry-from with a JSONL or CSV retry manifest.",
             file=sys.stderr,
         )
         return 1
@@ -1118,12 +1266,12 @@ def main() -> int:
 
     try:
         dotenv_path = load_environment_from_dotenv()
-        api_key = read_api_key(args.api_key_env)
         langfuse_runtime = setup_langfuse(args)
         maybe_ensure_provider_dependencies(provider_runtime)
         pricing = provider_runtime.module.resolve_model_pricing(args)
-        client = provider_runtime.module.make_client(
-            api_key,
+        client = make_provider_client(
+            provider_runtime,
+            args,
             enable_langfuse=langfuse_runtime.enabled,
         )
         mcp_headers = parse_mcp_headers(args.mcp_headers or [])
@@ -1182,6 +1330,7 @@ def main() -> int:
                         retry_manifest,
                         log_path=log_path,
                         record_index=record.record_index,
+                        record=record,
                     )
                     is not None
                 ]
