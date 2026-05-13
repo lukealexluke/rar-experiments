@@ -43,7 +43,6 @@ from query_openai_tex_mcp import (
     parse_nonnegative_int,
     prepare_upload_inputs,
     read_optional_float_env,
-    record_langfuse_retrieval_trace,
     safe_serialize_value,
     setup_langfuse,
     validate_input_path,
@@ -524,7 +523,6 @@ async def _run_response_async(
                     reasoning_effort=reasoning_effort,
                     max_output_tokens=max_output_tokens,
                 )
-                tool_trace_events: list[dict[str, Any]] = []
                 response = converse(
                     client=client,
                     model=model,
@@ -545,25 +543,17 @@ async def _run_response_async(
                     if not tool_uses:
                         response_data["mcp_available_tools"] = available_tool_names
                         response_data["mcp_tool_rounds"] = tool_rounds
-                        if tool_trace_events:
-                            response_data["retrieval_trace_events"] = tool_trace_events
                         return response, response_data, available_tool_names, thinking_note
 
                     tool_rounds += 1
                     tool_result_blocks = []
                     for tool_use in tool_uses:
-                        tool_result_block = await call_mcp_tool_for_bedrock(
-                            session=session,
-                            tool_use=tool_use,
-                            allowed_tool_names=set(available_tool_names),
-                            mcp_read_timeout=mcp_read_timeout,
-                        )
-                        tool_result_blocks.append(tool_result_block)
-                        tool_trace_events.append(
-                            build_mcp_tool_trace_event(
+                        tool_result_blocks.append(
+                            await call_mcp_tool_for_bedrock(
+                                session=session,
                                 tool_use=tool_use,
-                                tool_result_block=tool_result_block,
-                                round_index=tool_rounds,
+                                allowed_tool_names=set(available_tool_names),
+                                mcp_read_timeout=mcp_read_timeout,
                             )
                         )
                     messages.append({"role": "user", "content": tool_result_blocks})
@@ -788,34 +778,6 @@ def build_tool_result_block(
             "content": [{"json": payload}],
             "status": status,
         }
-    }
-
-
-def build_mcp_tool_trace_event(
-    *,
-    tool_use: dict[str, Any],
-    tool_result_block: dict[str, Any],
-    round_index: int,
-) -> dict[str, Any]:
-    tool_result = tool_result_block.get("toolResult")
-    if not isinstance(tool_result, dict):
-        tool_result = {}
-    content = tool_result.get("content")
-    return {
-        "kind": "mcp_call",
-        "tool_name": str(tool_use.get("name") or ""),
-        "tool_use_id": str(tool_use.get("toolUseId") or ""),
-        "round": round_index,
-        "status": tool_result.get("status"),
-        "input": {
-            "tool_name": tool_use.get("name"),
-            "tool_use_id": tool_use.get("toolUseId"),
-            "arguments": tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {},
-        },
-        "output": {
-            "status": tool_result.get("status"),
-            "content": content,
-        },
     }
 
 
@@ -1062,22 +1024,8 @@ def main() -> int:
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
                     cost_details = compute_langfuse_cost_details(usage_details, pricing)
-                    retrieval_trace_events = record_langfuse_retrieval_trace(
-                        langfuse_runtime,
-                        "claude",
-                        response_data,
-                    )
 
                     if generation_observation is not None:
-                        generation_metadata = build_langfuse_generation_result_metadata(
-                            pricing=pricing,
-                            usage_details=usage_details,
-                            cost_details=cost_details,
-                        )
-                        if retrieval_trace_events:
-                            generation_metadata["retrieval_trace_event_count"] = len(
-                                retrieval_trace_events
-                            )
                         generation_observation.update(
                             output=build_langfuse_generation_output(
                                 response_data=response_data,
@@ -1085,7 +1033,11 @@ def main() -> int:
                                 usage_details=usage_details,
                                 cost_details=cost_details,
                             ),
-                            metadata=generation_metadata,
+                            metadata=build_langfuse_generation_result_metadata(
+                                pricing=pricing,
+                                usage_details=usage_details,
+                                cost_details=cost_details,
+                            ),
                             model=args.model,
                             model_parameters=build_langfuse_model_parameters(args),
                             usage_details=usage_details or None,

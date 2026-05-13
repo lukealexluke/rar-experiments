@@ -41,11 +41,6 @@ DEFAULT_LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
 DEFAULT_OPENAI_INPUT_COST_ENV = "OPENAI_INPUT_COST_PER_1M"
 DEFAULT_OPENAI_CACHED_INPUT_COST_ENV = "OPENAI_CACHED_INPUT_COST_PER_1M"
 DEFAULT_OPENAI_OUTPUT_COST_ENV = "OPENAI_OUTPUT_COST_PER_1M"
-RESPONSE_HISTORY_KEY = "response_history"
-RETRIEVAL_TRACE_EVENTS_KEY = "retrieval_trace_events"
-LANGFUSE_RETRIEVAL_TRACE_MAX_STRING = 6000
-LANGFUSE_RETRIEVAL_TRACE_MAX_ITEMS = 25
-LANGFUSE_RETRIEVAL_TRACE_MAX_DEPTH = 6
 AUDIT_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+")
 WHOLEBODY_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+Line:\s+(\d+)$")
 STATEMENT_LOG_LINE_RE = re.compile(r"^Line:\s+(\d+)$")
@@ -1123,22 +1118,8 @@ def main() -> int:
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
                     cost_details = compute_langfuse_cost_details(usage_details, pricing)
-                    retrieval_trace_events = record_langfuse_retrieval_trace(
-                        langfuse_runtime,
-                        "openai",
-                        response_data,
-                    )
 
                     if generation_observation is not None:
-                        generation_metadata = build_langfuse_generation_result_metadata(
-                            pricing=pricing,
-                            usage_details=usage_details,
-                            cost_details=cost_details,
-                        )
-                        if retrieval_trace_events:
-                            generation_metadata["retrieval_trace_event_count"] = len(
-                                retrieval_trace_events
-                            )
                         generation_observation.update(
                             output=build_langfuse_generation_output(
                                 response_data=response_data,
@@ -1146,7 +1127,11 @@ def main() -> int:
                                 usage_details=usage_details,
                                 cost_details=cost_details,
                             ),
-                            metadata=generation_metadata,
+                            metadata=build_langfuse_generation_result_metadata(
+                                pricing=pricing,
+                                usage_details=usage_details,
+                                cost_details=cost_details,
+                            ),
                             model=args.model,
                             model_parameters=build_langfuse_model_parameters(args),
                             usage_details=usage_details or None,
@@ -1569,544 +1554,6 @@ def build_langfuse_generation_result_metadata(
     return metadata
 
 
-def record_langfuse_retrieval_trace(
-    langfuse_runtime: LangfuseRuntime,
-    provider_name: str,
-    response_data: dict[str, Any],
-) -> list[dict[str, Any]]:
-    events = extract_langfuse_retrieval_trace_events(provider_name, response_data)
-    if not events or not langfuse_runtime.enabled or langfuse_runtime.client is None:
-        return events
-
-    for event_index, event in enumerate(events, start=1):
-        metadata = dict(event.get("metadata") or {})
-        metadata["retrieval_trace_index"] = event_index
-        with langfuse_runtime.client.start_as_current_observation(
-            name=event.get("observation_name") or "retrieval.call",
-            as_type="span",
-            input=event.get("input"),
-            metadata=metadata,
-        ) as observation:
-            if observation is not None:
-                observation.update(output=event.get("output"))
-    return events
-
-
-def extract_langfuse_retrieval_trace_events(
-    provider_name: str,
-    response_data: dict[str, Any],
-) -> list[dict[str, Any]]:
-    provider_key = provider_name.strip().lower()
-    events = extract_prebuilt_retrieval_trace_events(provider_key, response_data)
-    if provider_key == "openai":
-        events.extend(extract_openai_retrieval_trace_events(response_data))
-    elif provider_key == "gemini":
-        events.extend(extract_gemini_retrieval_trace_events(response_data))
-    elif provider_key == "claude":
-        events.extend(extract_bedrock_retrieval_trace_events(response_data))
-    return events
-
-
-def extract_prebuilt_retrieval_trace_events(
-    provider_name: str,
-    response_data: dict[str, Any],
-) -> list[dict[str, Any]]:
-    raw_events = response_data.get(RETRIEVAL_TRACE_EVENTS_KEY)
-    if not isinstance(raw_events, list):
-        return []
-
-    events: list[dict[str, Any]] = []
-    for raw_index, raw_event in enumerate(raw_events, start=1):
-        if not isinstance(raw_event, dict):
-            continue
-        kind = normalize_optional_text(raw_event.get("kind")) or "retrieval"
-        tool_name = normalize_optional_text(
-            raw_event.get("tool_name") or raw_event.get("name")
-        )
-        metadata = {
-            "provider": provider_name,
-            "kind": kind,
-            "tool_name": tool_name,
-            "status": normalize_optional_text(raw_event.get("status")) or None,
-            "round": raw_event.get("round"),
-            "tool_use_id": raw_event.get("tool_use_id"),
-            "source": "provider_runtime",
-            "raw_event_index": raw_index,
-        }
-        extra_metadata = raw_event.get("metadata")
-        if isinstance(extra_metadata, dict):
-            metadata.update(extra_metadata)
-        events.append(
-            build_langfuse_retrieval_trace_event(
-                provider_name=provider_name,
-                kind=kind,
-                tool_name=tool_name,
-                input_payload=raw_event.get("input"),
-                output_payload=raw_event.get("output"),
-                metadata=metadata,
-            )
-        )
-    return events
-
-
-def extract_openai_retrieval_trace_events(response_data: dict[str, Any]) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    for response_index, snapshot in iter_response_snapshots(response_data):
-        response_id = normalize_optional_text(snapshot.get("id"))
-        citations = extract_openai_web_citations(snapshot)
-        output_items = snapshot.get("output")
-        if not isinstance(output_items, list):
-            continue
-
-        for output_index, item in enumerate(output_items, start=1):
-            if not isinstance(item, dict):
-                continue
-            raw_type = normalize_optional_text(item.get("type"))
-            if raw_type == "web_search_call":
-                action = item.get("action")
-                query = extract_web_search_query(item)
-                output_payload = omit_keys(item, {"action"})
-                if citations:
-                    output_payload["citations"] = citations
-                events.append(
-                    build_langfuse_retrieval_trace_event(
-                        provider_name="openai",
-                        kind="web_search",
-                        input_payload={
-                            "query": query,
-                            "action": parse_json_if_string(action),
-                        },
-                        output_payload=output_payload,
-                        metadata={
-                            "provider": "openai",
-                            "kind": "web_search",
-                            "raw_type": raw_type,
-                            "item_id": item.get("id"),
-                            "status": item.get("status"),
-                            "response_id": response_id,
-                            "response_index": response_index,
-                            "output_index": output_index,
-                        },
-                    )
-                )
-                continue
-
-            if raw_type in {"mcp_call", "mcp_tool_call"}:
-                tool_name = normalize_optional_text(
-                    item.get("name")
-                    or item.get("tool_name")
-                    or item.get("tool")
-                    or item.get("server_label")
-                )
-                arguments = parse_json_if_string(
-                    item.get("arguments")
-                    or item.get("input")
-                    or item.get("parameters")
-                )
-                result = parse_json_if_string(
-                    item.get("output")
-                    or item.get("result")
-                    or item.get("error")
-                )
-                events.append(
-                    build_langfuse_retrieval_trace_event(
-                        provider_name="openai",
-                        kind="mcp_call",
-                        tool_name=tool_name,
-                        input_payload={
-                            "tool_name": tool_name,
-                            "server_label": item.get("server_label"),
-                            "arguments": arguments,
-                        },
-                        output_payload={
-                            "status": item.get("status"),
-                            "result": result,
-                            "raw": omit_keys(
-                                item,
-                                {"arguments", "input", "parameters", "output", "result"},
-                            ),
-                        },
-                        metadata={
-                            "provider": "openai",
-                            "kind": "mcp_call",
-                            "raw_type": raw_type,
-                            "tool_name": tool_name,
-                            "item_id": item.get("id"),
-                            "status": item.get("status"),
-                            "response_id": response_id,
-                            "response_index": response_index,
-                            "output_index": output_index,
-                        },
-                    )
-                )
-                continue
-
-            if raw_type == "mcp_approval_request":
-                tool_name = normalize_optional_text(item.get("name") or item.get("tool_name"))
-                events.append(
-                    build_langfuse_retrieval_trace_event(
-                        provider_name="openai",
-                        kind="mcp_approval_request",
-                        tool_name=tool_name,
-                        input_payload={
-                            "tool_name": tool_name,
-                            "server_label": item.get("server_label"),
-                            "arguments": parse_json_if_string(item.get("arguments")),
-                        },
-                        output_payload={
-                            "approval_request_id": item.get("id"),
-                            "status": item.get("status") or "requested",
-                        },
-                        metadata={
-                            "provider": "openai",
-                            "kind": "mcp_approval_request",
-                            "raw_type": raw_type,
-                            "tool_name": tool_name,
-                            "item_id": item.get("id"),
-                            "response_id": response_id,
-                            "response_index": response_index,
-                            "output_index": output_index,
-                        },
-                    )
-                )
-    return events
-
-
-def extract_gemini_retrieval_trace_events(response_data: dict[str, Any]) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    candidates = response_data.get("candidates")
-    if not isinstance(candidates, list):
-        return events
-
-    for candidate_index, candidate in enumerate(candidates, start=1):
-        if not isinstance(candidate, dict):
-            continue
-        grounding_metadata = read_mapping_value(
-            candidate,
-            "grounding_metadata",
-            "groundingMetadata",
-        )
-        if isinstance(grounding_metadata, dict):
-            queries = read_mapping_value(
-                grounding_metadata,
-                "web_search_queries",
-                "webSearchQueries",
-            )
-            if isinstance(queries, str):
-                queries = [queries]
-            if isinstance(queries, list):
-                for query_index, query in enumerate(queries, start=1):
-                    events.append(
-                        build_langfuse_retrieval_trace_event(
-                            provider_name="gemini",
-                            kind="web_search",
-                            input_payload={"query": query},
-                            output_payload={
-                                "grounding_chunks": read_mapping_value(
-                                    grounding_metadata,
-                                    "grounding_chunks",
-                                    "groundingChunks",
-                                ),
-                                "search_entry_point": read_mapping_value(
-                                    grounding_metadata,
-                                    "search_entry_point",
-                                    "searchEntryPoint",
-                                ),
-                            },
-                            metadata={
-                                "provider": "gemini",
-                                "kind": "web_search",
-                                "candidate_index": candidate_index,
-                                "query_index": query_index,
-                            },
-                        )
-                    )
-
-        parts = (
-            read_mapping_value(
-                read_mapping_value(candidate, "content") or {},
-                "parts",
-            )
-            or []
-        )
-        if not isinstance(parts, list):
-            continue
-        for part_index, part in enumerate(parts, start=1):
-            if not isinstance(part, dict):
-                continue
-            function_call = read_mapping_value(part, "function_call", "functionCall")
-            if not isinstance(function_call, dict):
-                continue
-            tool_name = normalize_optional_text(function_call.get("name"))
-            events.append(
-                build_langfuse_retrieval_trace_event(
-                    provider_name="gemini",
-                    kind="mcp_call",
-                    tool_name=tool_name,
-                    input_payload={
-                        "tool_name": tool_name,
-                        "arguments": read_mapping_value(function_call, "args", "arguments"),
-                    },
-                    output_payload=None,
-                    metadata={
-                        "provider": "gemini",
-                        "kind": "mcp_call",
-                        "tool_name": tool_name,
-                        "candidate_index": candidate_index,
-                        "part_index": part_index,
-                        "source": "function_call_part",
-                    },
-                )
-            )
-    return events
-
-
-def extract_bedrock_retrieval_trace_events(response_data: dict[str, Any]) -> list[dict[str, Any]]:
-    message = read_mapping_value(read_mapping_value(response_data, "output") or {}, "message")
-    content = read_mapping_value(message or {}, "content")
-    if not isinstance(content, list):
-        return []
-
-    events: list[dict[str, Any]] = []
-    for block_index, block in enumerate(content, start=1):
-        if not isinstance(block, dict):
-            continue
-        tool_use = block.get("toolUse")
-        if not isinstance(tool_use, dict):
-            continue
-        tool_name = normalize_optional_text(tool_use.get("name"))
-        events.append(
-            build_langfuse_retrieval_trace_event(
-                provider_name="claude",
-                kind="mcp_call",
-                tool_name=tool_name,
-                input_payload={
-                    "tool_name": tool_name,
-                    "tool_use_id": tool_use.get("toolUseId"),
-                    "arguments": tool_use.get("input"),
-                },
-                output_payload=None,
-                metadata={
-                    "provider": "claude",
-                    "kind": "mcp_call",
-                    "tool_name": tool_name,
-                    "tool_use_id": tool_use.get("toolUseId"),
-                    "block_index": block_index,
-                    "source": "bedrock_message_toolUse",
-                },
-            )
-        )
-    return events
-
-
-def build_langfuse_retrieval_trace_event(
-    *,
-    provider_name: str,
-    kind: str,
-    tool_name: str | None = None,
-    input_payload: Any = None,
-    output_payload: Any = None,
-    metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    observation_name = build_retrieval_observation_name(kind, tool_name)
-    compact_metadata = compact_langfuse_payload(
-        {key: value for key, value in (metadata or {}).items() if value is not None}
-    )
-    return {
-        "observation_name": observation_name,
-        "input": compact_langfuse_payload(input_payload),
-        "output": compact_langfuse_payload(output_payload),
-        "metadata": compact_metadata,
-    }
-
-
-def build_retrieval_observation_name(kind: str, tool_name: str | None) -> str:
-    kind_key = kind.strip().lower() or "call"
-    if kind_key == "web_search":
-        return "retrieval.web_search"
-    if kind_key == "mcp_approval_request":
-        return "retrieval.mcp.approval_request"
-    if kind_key == "mcp_call":
-        suffix = sanitize_observation_name_part(tool_name or "call")
-        return f"retrieval.mcp.{suffix}"
-    return f"retrieval.{sanitize_observation_name_part(kind_key)}"
-
-
-def sanitize_observation_name_part(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.:-]+", "_", value.strip())
-    return cleaned.strip("._:-") or "call"
-
-
-def compact_langfuse_payload(
-    value: Any,
-    *,
-    max_string: int = LANGFUSE_RETRIEVAL_TRACE_MAX_STRING,
-    max_items: int = LANGFUSE_RETRIEVAL_TRACE_MAX_ITEMS,
-    max_depth: int = LANGFUSE_RETRIEVAL_TRACE_MAX_DEPTH,
-) -> Any:
-    serialized = safe_serialize_value(value)
-    return compact_serialized_value(
-        serialized,
-        max_string=max_string,
-        max_items=max_items,
-        max_depth=max_depth,
-    )
-
-
-def compact_serialized_value(
-    value: Any,
-    *,
-    max_string: int,
-    max_items: int,
-    max_depth: int,
-) -> Any:
-    if max_depth < 0:
-        return "<truncated: max depth exceeded>"
-    if value is None or isinstance(value, (int, float, bool)):
-        return value
-    if isinstance(value, str):
-        if len(value) <= max_string:
-            return value
-        return value[:max_string] + f"... [truncated {len(value) - max_string} chars]"
-    if isinstance(value, list):
-        compacted = [
-            compact_serialized_value(
-                item,
-                max_string=max_string,
-                max_items=max_items,
-                max_depth=max_depth - 1,
-            )
-            for item in value[:max_items]
-        ]
-        if len(value) > max_items:
-            compacted.append({"_truncated_items": len(value) - max_items})
-        return compacted
-    if isinstance(value, dict):
-        compacted_dict: dict[str, Any] = {}
-        items = list(value.items())
-        for key, item in items[:max_items]:
-            compacted_dict[str(key)] = compact_serialized_value(
-                item,
-                max_string=max_string,
-                max_items=max_items,
-                max_depth=max_depth - 1,
-            )
-        if len(items) > max_items:
-            compacted_dict["_truncated_items"] = len(items) - max_items
-        return compacted_dict
-    return value
-
-
-def normalize_optional_text(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    return text
-
-
-def read_mapping_value(mapping: Any, *keys: str) -> Any:
-    if not isinstance(mapping, dict):
-        return None
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    return None
-
-
-def omit_keys(mapping: dict[str, Any], keys: set[str]) -> dict[str, Any]:
-    return {key: value for key, value in mapping.items() if key not in keys}
-
-
-def parse_json_if_string(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return value
-    if not (
-        (text.startswith("{") and text.endswith("}"))
-        or (text.startswith("[") and text.endswith("]"))
-    ):
-        return value
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return value
-
-
-def extract_web_search_query(item: dict[str, Any]) -> Any:
-    action = item.get("action")
-    if isinstance(action, dict):
-        query = read_mapping_value(action, "query", "search_query", "searchQuery")
-        if query is not None:
-            return query
-    return read_mapping_value(item, "query", "search_query", "searchQuery")
-
-
-def extract_openai_web_citations(response_data: dict[str, Any]) -> list[dict[str, Any]]:
-    citations: list[dict[str, Any]] = []
-    output_items = response_data.get("output")
-    if not isinstance(output_items, list):
-        return citations
-    for item in output_items:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        content_items = item.get("content")
-        if not isinstance(content_items, list):
-            continue
-        for content_item in content_items:
-            if not isinstance(content_item, dict):
-                continue
-            annotations = content_item.get("annotations")
-            if not isinstance(annotations, list):
-                continue
-            for annotation in annotations:
-                if not isinstance(annotation, dict):
-                    continue
-                annotation_type = normalize_optional_text(annotation.get("type"))
-                if "citation" not in annotation_type:
-                    continue
-                citations.append(
-                    {
-                        "type": annotation_type,
-                        "url": annotation.get("url"),
-                        "title": annotation.get("title"),
-                        "start_index": annotation.get("start_index"),
-                        "end_index": annotation.get("end_index"),
-                    }
-                )
-    return citations
-
-
-def iter_response_snapshots(response_data: dict[str, Any]):
-    history = response_data.get(RESPONSE_HISTORY_KEY)
-    if isinstance(history, list) and history:
-        for response_index, snapshot in enumerate(history, start=1):
-            if isinstance(snapshot, dict):
-                yield response_index, snapshot
-        return
-    yield 1, response_data
-
-
-def snapshot_response_for_history(response_data: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in response_data.items()
-        if key not in {RESPONSE_HISTORY_KEY}
-    }
-
-
-def attach_response_history(
-    response_data: dict[str, Any],
-    response_history: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if len(response_history) <= 1:
-        return response_data
-    response_with_history = dict(response_data)
-    response_with_history[RESPONSE_HISTORY_KEY] = response_history
-    return response_with_history
-
-
 def resolve_model_pricing(args: argparse.Namespace) -> ModelPricing | None:
     model_key = args.model.strip().lower()
     default_pricing = DEFAULT_MODEL_PRICING.get(model_key)
@@ -2303,7 +1750,6 @@ def run_response(
     retrieval_mode: str = DEFAULT_RETRIEVAL_MODE,
 ):
     tools = build_openai_tools(retrieval_mode=retrieval_mode, mcp_tool=mcp_tool)
-    response_history: list[dict[str, Any]] = []
     request: dict[str, Any] = {
         "model": model,
         "reasoning": {"effort": reasoning_effort},
@@ -2339,7 +1785,6 @@ def run_response(
     response = client.responses.create(**request)
 
     response_data = to_dict(response)
-    response_history.append(snapshot_response_for_history(response_data))
     previous_response_id = response_data.get("id")
     if retrieval_mode != "mcp" or not previous_response_id:
         return response, response_data
@@ -2347,7 +1792,7 @@ def run_response(
     for _ in range(DEFAULT_APPROVAL_LIMIT):
         approval_requests = extract_mcp_approval_requests(response_data)
         if not approval_requests:
-            return response, attach_response_history(response_data, response_history)
+            return response, response_data
 
         followup_request: dict[str, Any] = {
             "model": model,
@@ -2367,7 +1812,6 @@ def run_response(
         }
         response = client.responses.create(**followup_request)
         response_data = to_dict(response)
-        response_history.append(snapshot_response_for_history(response_data))
         previous_response_id = response_data.get("id", previous_response_id)
 
     raise RuntimeError(
