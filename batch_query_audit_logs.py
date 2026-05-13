@@ -1121,6 +1121,13 @@ def derive_result_status(response_status: str, output_text: str) -> str:
     return "ok" if output_text else "empty"
 
 
+def preview_malformed_response(output_text: str, limit: int = 100) -> str:
+    compact = " ".join(output_text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit]
+
+
 def maybe_ensure_provider_dependencies(provider_runtime: ProviderRuntime) -> None:
     ensure_runtime_dependencies = getattr(provider_runtime.module, "ensure_runtime_dependencies", None)
     if callable(ensure_runtime_dependencies):
@@ -1612,10 +1619,14 @@ def main() -> int:
                                     response_data,
                                 )
                                 cost_details = compute_langfuse_cost_details(usage_details, pricing)
-                                ai_id, ai_num = parse_ai_response(output_text)
                                 response_status = extract_response_status(response_data)
                                 incomplete_details = response_data.get("incomplete_details")
                                 status = derive_result_status(response_status, output_text)
+                                ai_id, ai_num = parse_ai_response(output_text)
+                                if status == "ok" and not output_text:
+                                    status = "empty"
+                                elif status == "ok" and (not ai_id or not ai_num):
+                                    status = "parse_failed"
                                 result.update(
                                     {
                                         "status": status,
@@ -1669,6 +1680,11 @@ def main() -> int:
                                         encoding="utf-8",
                                     )
                                     result["raw_response_file"] = str(raw_response_path)
+                                    malformed_preview = (
+                                        preview_malformed_response(output_text)
+                                        if status == "parse_failed"
+                                        else ""
+                                    )
                                     print(
                                         f"Warning: {log_path.name} item {record.record_index} returned "
                                         f"status={status}"
@@ -1679,6 +1695,11 @@ def main() -> int:
                                         ),
                                         file=sys.stderr,
                                     )
+                                    if malformed_preview:
+                                        print(
+                                            f"Malformed response preview: {malformed_preview}",
+                                            file=sys.stderr,
+                                        )
                 except Exception as exc:
                     result["error"] = format_exception_message(exc)
                     print(
