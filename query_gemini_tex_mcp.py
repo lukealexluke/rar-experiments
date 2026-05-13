@@ -43,6 +43,7 @@ from query_openai_tex_mcp import (
     prepare_upload_inputs,
     read_api_key,
     read_optional_float_env,
+    record_langfuse_retrieval_trace,
     safe_serialize_value,
     setup_langfuse,
     validate_input_path,
@@ -901,8 +902,22 @@ def main() -> int:
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
                     cost_details = compute_langfuse_cost_details(usage_details, pricing)
+                    retrieval_trace_events = record_langfuse_retrieval_trace(
+                        langfuse_runtime,
+                        "gemini",
+                        response_data,
+                    )
 
                     if generation_observation is not None:
+                        generation_metadata = build_langfuse_generation_result_metadata(
+                            pricing=pricing,
+                            usage_details=usage_details,
+                            cost_details=cost_details,
+                        )
+                        if retrieval_trace_events:
+                            generation_metadata["retrieval_trace_event_count"] = len(
+                                retrieval_trace_events
+                            )
                         generation_observation.update(
                             output=build_langfuse_generation_output(
                                 response_data=response_data,
@@ -910,11 +925,7 @@ def main() -> int:
                                 usage_details=usage_details,
                                 cost_details=cost_details,
                             ),
-                            metadata=build_langfuse_generation_result_metadata(
-                                pricing=pricing,
-                                usage_details=usage_details,
-                                cost_details=cost_details,
-                            ),
+                            metadata=generation_metadata,
                             model=args.model,
                             model_parameters=build_langfuse_model_parameters(args),
                             usage_details=usage_details or None,

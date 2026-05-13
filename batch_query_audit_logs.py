@@ -32,6 +32,7 @@ from query_openai_tex_mcp import (
     parse_nonnegative_int,
     prepare_upload_inputs,
     read_api_key,
+    record_langfuse_retrieval_trace,
     setup_langfuse,
 )
 from statement_reference_audit_wholebody import normalize_arxiv_id
@@ -1619,6 +1620,11 @@ def main() -> int:
                                     response_data,
                                 )
                                 cost_details = compute_langfuse_cost_details(usage_details, pricing)
+                                retrieval_trace_events = record_langfuse_retrieval_trace(
+                                    langfuse_runtime,
+                                    provider_runtime.name,
+                                    response_data,
+                                )
                                 response_status = extract_response_status(response_data)
                                 incomplete_details = response_data.get("incomplete_details")
                                 status = derive_result_status(response_status, output_text)
@@ -1641,6 +1647,15 @@ def main() -> int:
                                     }
                                 )
                                 if generation_observation is not None:
+                                    generation_metadata = build_langfuse_generation_result_metadata(
+                                        pricing=pricing,
+                                        usage_details=usage_details,
+                                        cost_details=cost_details,
+                                    )
+                                    if retrieval_trace_events:
+                                        generation_metadata["retrieval_trace_event_count"] = len(
+                                            retrieval_trace_events
+                                        )
                                     generation_observation.update(
                                         output=build_langfuse_generation_output(
                                             response_data=response_data,
@@ -1648,11 +1663,7 @@ def main() -> int:
                                             usage_details=usage_details,
                                             cost_details=cost_details,
                                         ),
-                                        metadata=build_langfuse_generation_result_metadata(
-                                            pricing=pricing,
-                                            usage_details=usage_details,
-                                            cost_details=cost_details,
-                                        ),
+                                        metadata=generation_metadata,
                                         model=args.model,
                                         model_parameters=build_langfuse_model_parameters(args),
                                         usage_details=usage_details or None,
