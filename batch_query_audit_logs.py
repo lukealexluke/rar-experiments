@@ -25,6 +25,7 @@ from query_openai_tex_mcp import (
     build_langfuse_generation_result_metadata,
     build_langfuse_model_parameters,
     compute_langfuse_cost_details,
+    extract_langfuse_tool_calls,
     flush_langfuse,
     load_environment_from_dotenv,
     parse_audit_log,
@@ -32,6 +33,7 @@ from query_openai_tex_mcp import (
     parse_nonnegative_int,
     prepare_upload_inputs,
     read_api_key,
+    record_langfuse_tool_calls,
     setup_langfuse,
 )
 from statement_reference_audit_wholebody import normalize_arxiv_id
@@ -1043,11 +1045,14 @@ def build_langfuse_batch_span_output(
     cost_details: dict[str, float],
     result_status: str,
 ) -> dict[str, Any]:
+    tool_calls = extract_langfuse_tool_calls(response_data)
     return {
         "response_id": extract_response_id(response_data),
         "status": result_status,
         "response_status": extract_response_status(response_data),
         "output_text": output_text or None,
+        "tool_call_count": len(tool_calls),
+        "tool_calls": tool_calls or None,
         "usage_details": usage_details or None,
         "cost_details": cost_details or None,
     }
@@ -1059,10 +1064,13 @@ def build_langfuse_generation_output(
     usage_details: dict[str, int],
     cost_details: dict[str, float],
 ) -> dict[str, Any]:
+    tool_calls = extract_langfuse_tool_calls(response_data)
     return {
         "response_id": extract_response_id(response_data),
         "status": extract_response_status(response_data) or None,
         "output_text": output_text or None,
+        "tool_call_count": len(tool_calls),
+        "tool_calls": tool_calls or None,
         "usage_details": usage_details or None,
         "cost_details": cost_details or None,
     }
@@ -1619,6 +1627,7 @@ def main() -> int:
                                     response_data,
                                 )
                                 cost_details = compute_langfuse_cost_details(usage_details, pricing)
+                                tool_calls = extract_langfuse_tool_calls(response_data)
                                 response_status = extract_response_status(response_data)
                                 incomplete_details = response_data.get("incomplete_details")
                                 status = derive_result_status(response_status, output_text)
@@ -1641,6 +1650,10 @@ def main() -> int:
                                     }
                                 )
                                 if generation_observation is not None:
+                                    record_langfuse_tool_calls(
+                                        langfuse_runtime.client,
+                                        tool_calls,
+                                    )
                                     generation_observation.update(
                                         output=build_langfuse_generation_output(
                                             response_data=response_data,

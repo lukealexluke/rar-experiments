@@ -36,6 +36,7 @@ from query_openai_tex_mcp import (
     build_user_prompt,
     coalesce_float,
     compute_langfuse_cost_details,
+    extract_langfuse_tool_calls,
     flush_langfuse,
     load_environment_from_dotenv,
     parse_nonnegative_int,
@@ -43,6 +44,7 @@ from query_openai_tex_mcp import (
     prepare_upload_inputs,
     read_api_key,
     read_optional_float_env,
+    record_langfuse_tool_calls,
     safe_serialize_value,
     setup_langfuse,
     validate_input_path,
@@ -534,6 +536,13 @@ async def _run_response_async(
             "max_output_tokens": max_output_tokens,
             "thinking_config": thinking_config,
         }
+        if retrieval_mode == "mcp":
+            try:
+                config_kwargs["automatic_function_calling"] = (
+                    types.AutomaticFunctionCallingConfig(ignore_call_history=False)
+                )
+            except AttributeError:
+                pass
         if retrieval_mode == "web-search":
             try:
                 config_kwargs["tools"] = [
@@ -901,8 +910,10 @@ def main() -> int:
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
                     cost_details = compute_langfuse_cost_details(usage_details, pricing)
+                    tool_calls = extract_langfuse_tool_calls(response_data)
 
                     if generation_observation is not None:
+                        record_langfuse_tool_calls(langfuse_runtime.client, tool_calls)
                         generation_observation.update(
                             output=build_langfuse_generation_output(
                                 response_data=response_data,

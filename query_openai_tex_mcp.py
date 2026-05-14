@@ -41,6 +41,10 @@ DEFAULT_LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
 DEFAULT_OPENAI_INPUT_COST_ENV = "OPENAI_INPUT_COST_PER_1M"
 DEFAULT_OPENAI_CACHED_INPUT_COST_ENV = "OPENAI_CACHED_INPUT_COST_PER_1M"
 DEFAULT_OPENAI_OUTPUT_COST_ENV = "OPENAI_OUTPUT_COST_PER_1M"
+LANGFUSE_TOOL_CALL_LIMIT = 50
+LANGFUSE_TOOL_VALUE_STRING_LIMIT = 4000
+LANGFUSE_TOOL_VALUE_LIST_LIMIT = 25
+LANGFUSE_TOOL_VALUE_DICT_LIMIT = 80
 AUDIT_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+")
 WHOLEBODY_LOG_ENTRY_RE = re.compile(r"^\[(\d+)\]\s+Line:\s+(\d+)$")
 STATEMENT_LOG_LINE_RE = re.compile(r"^Line:\s+(\d+)$")
@@ -1118,8 +1122,10 @@ def main() -> int:
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
                     cost_details = compute_langfuse_cost_details(usage_details, pricing)
+                    tool_calls = extract_langfuse_tool_calls(response_data)
 
                     if generation_observation is not None:
+                        record_langfuse_tool_calls(langfuse_runtime.client, tool_calls)
                         generation_observation.update(
                             output=build_langfuse_generation_output(
                                 response_data=response_data,
@@ -1450,11 +1456,14 @@ def build_langfuse_observation_output(
     usage_details: dict[str, int],
     cost_details: dict[str, float],
 ) -> dict[str, Any]:
+    tool_calls = extract_langfuse_tool_calls(response_data)
     return {
         "response_id": response_data.get("id"),
         "has_text_output": bool(output_text),
         "output_text": output_text or None,
         "mcp_approval_requests": len(extract_mcp_approval_requests(response_data)),
+        "tool_call_count": len(tool_calls),
+        "tool_calls": tool_calls or None,
         "usage_details": usage_details or None,
         "cost_details": cost_details or None,
     }
@@ -1531,13 +1540,546 @@ def build_langfuse_generation_output(
     usage_details: dict[str, int],
     cost_details: dict[str, float],
 ) -> dict[str, Any]:
+    tool_calls = extract_langfuse_tool_calls(response_data)
     return {
         "response_id": response_data.get("id"),
         "status": response_data.get("status"),
         "output_text": output_text or None,
+        "tool_call_count": len(tool_calls),
+        "tool_calls": tool_calls or None,
         "usage_details": usage_details or None,
         "cost_details": cost_details or None,
     }
+
+
+def extract_langfuse_tool_calls(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_calls: list[dict[str, Any]] = []
+    for key in ("langfuse_tool_calls", "mcp_tool_calls"):
+        value = response_data.get(key)
+        if isinstance(value, list):
+            raw_calls.extend(item for item in value if isinstance(item, dict))
+
+    raw_calls.extend(extract_openai_tool_calls(response_data))
+    raw_calls.extend(extract_gemini_tool_calls(response_data))
+    raw_calls.extend(extract_bedrock_tool_calls(response_data))
+
+    normalized_calls = [
+        normalize_langfuse_tool_call(call)
+        for call in raw_calls
+        if isinstance(call, dict)
+    ]
+    return dedupe_langfuse_tool_calls(normalized_calls)[:LANGFUSE_TOOL_CALL_LIMIT]
+
+
+def record_langfuse_tool_calls(
+    langfuse_client: Any,
+    tool_calls: list[dict[str, Any]],
+) -> None:
+    for index, tool_call in enumerate(tool_calls[:LANGFUSE_TOOL_CALL_LIMIT], start=1):
+        name = clean_langfuse_tool_name(
+            normalize_langfuse_scalar(tool_call.get("name")) or "tool_call"
+        )
+        status = normalize_langfuse_scalar(tool_call.get("status")).lower()
+        metadata = {
+            key: value
+            for key, value in tool_call.items()
+            if key not in {"input", "output"}
+        }
+        metadata["tool_call_index"] = index
+        level = "ERROR" if status == "error" else None
+        try:
+            with langfuse_client.start_as_current_observation(
+                name=f"tool.{name}",
+                as_type="tool",
+                input=tool_call.get("input"),
+                output=tool_call.get("output"),
+                metadata=metadata,
+                level=level,
+            ):
+                pass
+        except Exception:
+            pass
+
+
+def append_langfuse_tool_calls(
+    response_data: dict[str, Any],
+    tool_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if tool_calls:
+        response_data["langfuse_tool_calls"] = dedupe_langfuse_tool_calls(
+            [normalize_langfuse_tool_call(call) for call in tool_calls]
+        )
+    return response_data
+
+
+def normalize_langfuse_tool_call(call: dict[str, Any]) -> dict[str, Any]:
+    input_value = first_present(call, ("input", "arguments", "parameters", "action"))
+    output_value = first_present(call, ("output", "result", "response"))
+    input_value = coerce_json_value(input_value)
+    output_value = coerce_json_value(output_value)
+    query = normalize_langfuse_scalar(call.get("query")) or extract_query_from_tool_value(
+        input_value
+    )
+
+    normalized: dict[str, Any] = {
+        "provider": normalize_langfuse_scalar(call.get("provider")) or None,
+        "tool_type": normalize_langfuse_scalar(call.get("tool_type"))
+        or normalize_langfuse_scalar(call.get("type"))
+        or None,
+        "name": normalize_langfuse_scalar(call.get("name"))
+        or normalize_langfuse_scalar(call.get("tool_name"))
+        or None,
+        "id": normalize_langfuse_scalar(call.get("id"))
+        or normalize_langfuse_scalar(call.get("tool_use_id"))
+        or normalize_langfuse_scalar(call.get("call_id"))
+        or None,
+        "status": normalize_langfuse_scalar(call.get("status")) or None,
+        "query": query or None,
+        "input": compact_langfuse_value(input_value) if input_value is not None else None,
+        "output": compact_langfuse_value(output_value) if output_value is not None else None,
+        "raw_type": normalize_langfuse_scalar(call.get("raw_type")) or None,
+    }
+
+    metadata: dict[str, Any] = {}
+    for key, value in call.items():
+        if key in {
+            "provider",
+            "tool_type",
+            "type",
+            "name",
+            "tool_name",
+            "id",
+            "tool_use_id",
+            "call_id",
+            "status",
+            "query",
+            "input",
+            "arguments",
+            "parameters",
+            "action",
+            "output",
+            "result",
+            "response",
+            "raw_type",
+        }:
+            continue
+        if value is not None:
+            metadata[str(key)] = compact_langfuse_value(value)
+    if metadata:
+        normalized["metadata"] = metadata
+
+    return {key: value for key, value in normalized.items() if value is not None}
+
+
+def dedupe_langfuse_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique_calls: list[dict[str, Any]] = []
+    for call in tool_calls:
+        key = langfuse_tool_call_key(call)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_calls.append(call)
+    return unique_calls
+
+
+def langfuse_tool_call_key(call: dict[str, Any]) -> str:
+    provider = normalize_langfuse_scalar(call.get("provider"))
+    tool_type = normalize_langfuse_scalar(call.get("tool_type"))
+    name = normalize_langfuse_scalar(call.get("name"))
+    call_id = normalize_langfuse_scalar(call.get("id"))
+    query = normalize_langfuse_scalar(call.get("query"))
+    if call_id or query:
+        return "|".join((provider, tool_type, name, call_id, query))
+    return json.dumps(call, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def extract_openai_tool_calls(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    output = response_data.get("output")
+    if not isinstance(output, list):
+        return []
+
+    calls: list[dict[str, Any]] = []
+    for index, item in enumerate(output):
+        if not isinstance(item, dict):
+            continue
+        item_type = normalize_langfuse_scalar(item.get("type"))
+        if item_type == "web_search_call":
+            action = first_present(item, ("action", "query", "search_query"))
+            calls.append(
+                {
+                    "provider": "openai",
+                    "tool_type": "web_search",
+                    "name": "web_search",
+                    "id": item.get("id"),
+                    "status": item.get("status"),
+                    "query": extract_query_from_tool_value(action)
+                    or extract_query_from_tool_value(item),
+                    "input": action if action is not None else item,
+                    "raw_type": item_type,
+                    "index": index,
+                }
+            )
+            continue
+
+        if item_type in {"mcp_call", "mcp_tool_call"} or (
+            item_type.startswith("mcp_")
+            and "call" in item_type
+            and item_type != "mcp_approval_request"
+        ):
+            calls.append(
+                {
+                    "provider": "openai",
+                    "tool_type": "mcp",
+                    "name": first_present(item, ("name", "tool_name", "server_label")),
+                    "id": first_present(item, ("id", "call_id")),
+                    "status": item.get("status"),
+                    "input": first_present(item, ("arguments", "input", "parameters")),
+                    "output": first_present(item, ("output", "result")),
+                    "raw_type": item_type,
+                    "server_label": item.get("server_label"),
+                    "index": index,
+                }
+            )
+            continue
+
+        if item_type in {"function_call", "tool_call"}:
+            calls.append(
+                {
+                    "provider": "openai",
+                    "tool_type": "function",
+                    "name": first_present(item, ("name", "tool_name")),
+                    "id": first_present(item, ("id", "call_id")),
+                    "status": item.get("status"),
+                    "input": first_present(item, ("arguments", "input", "parameters")),
+                    "output": first_present(item, ("output", "result")),
+                    "raw_type": item_type,
+                    "index": index,
+                }
+            )
+    return calls
+
+
+def extract_gemini_tool_calls(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    candidates = response_data.get("candidates")
+    if not isinstance(candidates, list):
+        candidates = []
+
+    for candidate_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        grounding_metadata = first_present(
+            candidate,
+            ("grounding_metadata", "groundingMetadata"),
+        )
+        if isinstance(grounding_metadata, dict):
+            calls.extend(
+                extract_gemini_grounding_tool_calls(
+                    grounding_metadata,
+                    candidate_index=candidate_index,
+                )
+            )
+        content = candidate.get("content")
+        calls.extend(
+            extract_gemini_function_tool_calls(
+                [content] if isinstance(content, dict) else [],
+                source="candidates",
+                candidate_index=candidate_index,
+            )
+        )
+
+    history = first_present(
+        response_data,
+        ("automatic_function_calling_history", "automaticFunctionCallingHistory"),
+    )
+    if isinstance(history, list):
+        calls.extend(
+            extract_gemini_function_tool_calls(
+                [item for item in history if isinstance(item, dict)],
+                source="automatic_function_calling_history",
+            )
+        )
+    return calls
+
+
+def extract_gemini_grounding_tool_calls(
+    grounding_metadata: dict[str, Any],
+    *,
+    candidate_index: int,
+) -> list[dict[str, Any]]:
+    queries = first_present(
+        grounding_metadata,
+        ("web_search_queries", "webSearchQueries"),
+    )
+    if not isinstance(queries, list):
+        return []
+
+    sources = extract_gemini_grounding_sources(grounding_metadata)
+    calls: list[dict[str, Any]] = []
+    for query_index, query in enumerate(queries):
+        query_text = normalize_langfuse_scalar(query)
+        if not query_text:
+            continue
+        calls.append(
+            {
+                "provider": "gemini",
+                "tool_type": "web_search",
+                "name": "google_search",
+                "query": query_text,
+                "input": {"query": query_text},
+                "output": {"grounding_sources": sources} if sources else None,
+                "raw_type": "grounding_metadata.web_search_queries",
+                "candidate_index": candidate_index,
+                "query_index": query_index,
+            }
+        )
+    return calls
+
+
+def extract_gemini_grounding_sources(
+    grounding_metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    chunks = first_present(
+        grounding_metadata,
+        ("grounding_chunks", "groundingChunks"),
+    )
+    if not isinstance(chunks, list):
+        return []
+
+    sources: list[dict[str, Any]] = []
+    for chunk in chunks[:LANGFUSE_TOOL_VALUE_LIST_LIMIT]:
+        if not isinstance(chunk, dict):
+            continue
+        web = chunk.get("web")
+        if not isinstance(web, dict):
+            continue
+        source: dict[str, Any] = {}
+        for key in ("title", "uri", "domain"):
+            value = normalize_langfuse_scalar(web.get(key))
+            if value:
+                source[key] = value
+        if source:
+            sources.append(source)
+    return sources
+
+
+def extract_gemini_function_tool_calls(
+    contents: list[dict[str, Any]],
+    *,
+    source: str,
+    candidate_index: int | None = None,
+) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    pending_indexes: list[int] = []
+    for content_index, content in enumerate(contents):
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        role = normalize_langfuse_scalar(content.get("role")) or None
+        for part_index, part in enumerate(parts):
+            if not isinstance(part, dict):
+                continue
+            function_call = first_present(part, ("function_call", "functionCall"))
+            if isinstance(function_call, dict):
+                calls.append(
+                    {
+                        "provider": "gemini",
+                        "tool_type": "function",
+                        "name": function_call.get("name"),
+                        "id": function_call.get("id"),
+                        "input": first_present(function_call, ("args", "arguments")),
+                        "raw_type": "function_call",
+                        "source": source,
+                        "role": role,
+                        "candidate_index": candidate_index,
+                        "content_index": content_index,
+                        "part_index": part_index,
+                    }
+                )
+                pending_indexes.append(len(calls) - 1)
+                continue
+
+            function_response = first_present(
+                part,
+                ("function_response", "functionResponse"),
+            )
+            if isinstance(function_response, dict):
+                matched_index = find_matching_gemini_tool_call(
+                    calls,
+                    pending_indexes,
+                    function_response,
+                )
+                if matched_index is None:
+                    calls.append(
+                        {
+                            "provider": "gemini",
+                            "tool_type": "function",
+                            "name": function_response.get("name"),
+                            "id": function_response.get("id"),
+                            "output": function_response.get("response"),
+                            "status": "success",
+                            "raw_type": "function_response",
+                            "source": source,
+                            "role": role,
+                            "candidate_index": candidate_index,
+                            "content_index": content_index,
+                            "part_index": part_index,
+                        }
+                    )
+                    continue
+                calls[matched_index]["output"] = function_response.get("response")
+                calls[matched_index]["status"] = "success"
+    return calls
+
+
+def find_matching_gemini_tool_call(
+    calls: list[dict[str, Any]],
+    pending_indexes: list[int],
+    function_response: dict[str, Any],
+) -> int | None:
+    response_id = normalize_langfuse_scalar(function_response.get("id"))
+    response_name = normalize_langfuse_scalar(function_response.get("name"))
+    for pending_index in reversed(pending_indexes):
+        call = calls[pending_index]
+        call_id = normalize_langfuse_scalar(call.get("id"))
+        call_name = normalize_langfuse_scalar(call.get("name"))
+        if response_id and call_id == response_id:
+            pending_indexes.remove(pending_index)
+            return pending_index
+        if response_name and call_name == response_name:
+            pending_indexes.remove(pending_index)
+            return pending_index
+    return None
+
+
+def extract_bedrock_tool_calls(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    output = response_data.get("output")
+    if not isinstance(output, dict):
+        return calls
+    message = output.get("message")
+    if not isinstance(message, dict):
+        return calls
+    content = message.get("content")
+    if not isinstance(content, list):
+        return calls
+    for index, block in enumerate(content):
+        if not isinstance(block, dict):
+            continue
+        tool_use = block.get("toolUse")
+        if not isinstance(tool_use, dict):
+            continue
+        calls.append(
+            {
+                "provider": "claude_bedrock",
+                "tool_type": "mcp",
+                "name": tool_use.get("name"),
+                "id": tool_use.get("toolUseId"),
+                "input": tool_use.get("input"),
+                "raw_type": "toolUse",
+                "index": index,
+            }
+        )
+    return calls
+
+
+def first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def coerce_json_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    if text[0] not in "[{":
+        return value
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def extract_query_from_tool_value(value: Any) -> str:
+    value = coerce_json_value(value)
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in (
+            "query",
+            "search_query",
+            "searchQuery",
+            "q",
+            "text",
+            "statement",
+            "keywords",
+        ):
+            found = normalize_langfuse_scalar(value.get(key))
+            if found:
+                return found
+        for nested_key in ("input", "arguments", "parameters", "action"):
+            nested = value.get(nested_key)
+            if isinstance(nested, (dict, str)):
+                found = extract_query_from_tool_value(nested)
+                if found:
+                    return found
+    return ""
+
+
+def compact_langfuse_value(value: Any, depth: int = 0) -> Any:
+    value = safe_serialize_value(value)
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        return truncate_langfuse_text(value, LANGFUSE_TOOL_VALUE_STRING_LIMIT)
+    if depth >= 5:
+        return truncate_langfuse_text(
+            json.dumps(value, ensure_ascii=False, default=str),
+            LANGFUSE_TOOL_VALUE_STRING_LIMIT,
+        )
+    if isinstance(value, list):
+        compacted = [
+            compact_langfuse_value(item, depth + 1)
+            for item in value[:LANGFUSE_TOOL_VALUE_LIST_LIMIT]
+        ]
+        if len(value) > LANGFUSE_TOOL_VALUE_LIST_LIMIT:
+            compacted.append(
+                {"omitted_items": len(value) - LANGFUSE_TOOL_VALUE_LIST_LIMIT}
+            )
+        return compacted
+    if isinstance(value, dict):
+        compacted_dict: dict[str, Any] = {}
+        items = list(value.items())
+        for key, item in items[:LANGFUSE_TOOL_VALUE_DICT_LIMIT]:
+            compacted_dict[str(key)] = compact_langfuse_value(item, depth + 1)
+        if len(items) > LANGFUSE_TOOL_VALUE_DICT_LIMIT:
+            compacted_dict["omitted_keys"] = len(items) - LANGFUSE_TOOL_VALUE_DICT_LIMIT
+        return compacted_dict
+    return truncate_langfuse_text(str(value), LANGFUSE_TOOL_VALUE_STRING_LIMIT)
+
+
+def truncate_langfuse_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
+def normalize_langfuse_scalar(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""
+    return str(value).strip()
+
+
+def clean_langfuse_tool_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    return cleaned[:80] or "tool_call"
 
 
 def build_langfuse_generation_result_metadata(
@@ -1785,14 +2327,15 @@ def run_response(
     response = client.responses.create(**request)
 
     response_data = to_dict(response)
+    tool_calls = extract_openai_tool_calls(response_data)
     previous_response_id = response_data.get("id")
     if retrieval_mode != "mcp" or not previous_response_id:
-        return response, response_data
+        return response, append_langfuse_tool_calls(response_data, tool_calls)
 
     for _ in range(DEFAULT_APPROVAL_LIMIT):
         approval_requests = extract_mcp_approval_requests(response_data)
         if not approval_requests:
-            return response, response_data
+            return response, append_langfuse_tool_calls(response_data, tool_calls)
 
         followup_request: dict[str, Any] = {
             "model": model,
@@ -1812,6 +2355,7 @@ def run_response(
         }
         response = client.responses.create(**followup_request)
         response_data = to_dict(response)
+        tool_calls.extend(extract_openai_tool_calls(response_data))
         previous_response_id = response_data.get("id", previous_response_id)
 
     raise RuntimeError(

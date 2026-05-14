@@ -37,12 +37,14 @@ from query_openai_tex_mcp import (
     build_user_prompt,
     coalesce_float,
     compute_langfuse_cost_details,
+    extract_langfuse_tool_calls,
     flush_langfuse,
     load_environment_from_dotenv,
     parse_mcp_headers,
     parse_nonnegative_int,
     prepare_upload_inputs,
     read_optional_float_env,
+    record_langfuse_tool_calls,
     safe_serialize_value,
     setup_langfuse,
     validate_input_path,
@@ -533,6 +535,7 @@ async def _run_response_async(
                 )
 
                 tool_rounds = 0
+                mcp_tool_calls: list[dict[str, Any]] = []
                 for _ in range(DEFAULT_APPROVAL_LIMIT):
                     response_data = normalize_bedrock_response(response)
                     response_message = response_data.get("output", {}).get("message")
@@ -543,17 +546,24 @@ async def _run_response_async(
                     if not tool_uses:
                         response_data["mcp_available_tools"] = available_tool_names
                         response_data["mcp_tool_rounds"] = tool_rounds
+                        response_data["langfuse_tool_calls"] = mcp_tool_calls
                         return response, response_data, available_tool_names, thinking_note
 
                     tool_rounds += 1
                     tool_result_blocks = []
                     for tool_use in tool_uses:
-                        tool_result_blocks.append(
-                            await call_mcp_tool_for_bedrock(
-                                session=session,
+                        tool_result = await call_mcp_tool_for_bedrock(
+                            session=session,
+                            tool_use=tool_use,
+                            allowed_tool_names=set(available_tool_names),
+                            mcp_read_timeout=mcp_read_timeout,
+                        )
+                        tool_result_blocks.append(tool_result)
+                        mcp_tool_calls.append(
+                            build_bedrock_langfuse_tool_call(
                                 tool_use=tool_use,
-                                allowed_tool_names=set(available_tool_names),
-                                mcp_read_timeout=mcp_read_timeout,
+                                tool_result_block=tool_result,
+                                round_index=tool_rounds,
                             )
                         )
                     messages.append({"role": "user", "content": tool_result_blocks})
@@ -779,6 +789,41 @@ def build_tool_result_block(
             "status": status,
         }
     }
+
+
+def build_bedrock_langfuse_tool_call(
+    *,
+    tool_use: dict[str, Any],
+    tool_result_block: dict[str, Any],
+    round_index: int,
+) -> dict[str, Any]:
+    tool_result = tool_result_block.get("toolResult")
+    if not isinstance(tool_result, dict):
+        tool_result = {}
+    return {
+        "provider": "claude_bedrock",
+        "tool_type": "mcp",
+        "name": tool_use.get("name"),
+        "id": tool_use.get("toolUseId"),
+        "status": tool_result.get("status"),
+        "input": tool_use.get("input"),
+        "output": extract_bedrock_tool_result_payload(tool_result),
+        "raw_type": "toolUse",
+        "round": round_index,
+    }
+
+
+def extract_bedrock_tool_result_payload(tool_result: dict[str, Any]) -> Any:
+    content = tool_result.get("content")
+    if not isinstance(content, list) or not content:
+        return None
+    if len(content) == 1 and isinstance(content[0], dict):
+        block = content[0]
+        if "json" in block:
+            return block["json"]
+        if "text" in block:
+            return block["text"]
+    return content
 
 
 def extract_output_text(response, response_data: dict[str, Any]) -> str:
@@ -1024,8 +1069,10 @@ def main() -> int:
                     output_text = extract_output_text(response, response_data)
                     usage_details = extract_langfuse_usage_details(response, response_data)
                     cost_details = compute_langfuse_cost_details(usage_details, pricing)
+                    tool_calls = extract_langfuse_tool_calls(response_data)
 
                     if generation_observation is not None:
+                        record_langfuse_tool_calls(langfuse_runtime.client, tool_calls)
                         generation_observation.update(
                             output=build_langfuse_generation_output(
                                 response_data=response_data,
