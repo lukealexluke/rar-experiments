@@ -59,6 +59,10 @@ DEFAULT_REASONING_EFFORT = "medium"
 DEFAULT_GEMINI_INPUT_COST_ENV = "GEMINI_INPUT_COST_PER_1M"
 DEFAULT_GEMINI_CACHED_INPUT_COST_ENV = "GEMINI_CACHED_INPUT_COST_PER_1M"
 DEFAULT_GEMINI_OUTPUT_COST_ENV = "GEMINI_OUTPUT_COST_PER_1M"
+DEFAULT_GEMINI_MCP_MAX_REMOTE_CALLS = 10
+GEMINI_MCP_FINALIZER_TOOL_CALL_LIMIT = 10
+GEMINI_MCP_FINALIZER_RESULT_LIMIT = 4
+GEMINI_MCP_FINALIZER_TEXT_LIMIT = 700
 
 DEFAULT_MODEL_PRICING: dict[str, ModelPricing] = {
     "gemini-2.5-pro": ModelPricing(
@@ -539,7 +543,10 @@ async def _run_response_async(
         if retrieval_mode == "mcp":
             try:
                 config_kwargs["automatic_function_calling"] = (
-                    types.AutomaticFunctionCallingConfig(ignore_call_history=False)
+                    types.AutomaticFunctionCallingConfig(
+                        maximum_remote_calls=DEFAULT_GEMINI_MCP_MAX_REMOTE_CALLS,
+                        ignore_call_history=False,
+                    )
                 )
             except AttributeError:
                 pass
@@ -619,14 +626,236 @@ async def _run_response_async(
                         contents=[prompt, tex_upload, bib_upload],
                         config=config,
                     )
+                    response_data = to_dict(response)
+                    if should_finalize_empty_mcp_response(response, response_data):
+                        response, response_data = await finalize_empty_mcp_response(
+                            async_client=async_client,
+                            types=types,
+                            model=model,
+                            thinking_config=thinking_config,
+                            max_output_tokens=max_output_tokens,
+                            prompt=prompt,
+                            tex_upload=tex_upload,
+                            bib_upload=bib_upload,
+                            search_response=response,
+                            search_response_data=response_data,
+                        )
                     return (
                         response,
-                        to_dict(response),
+                        response_data,
                         available_tool_names or requested_tools,
                         thinking_note,
                     )
     finally:
         await async_client.aclose()
+
+
+def should_finalize_empty_mcp_response(response, response_data: dict[str, Any]) -> bool:
+    if extract_output_text(response, response_data):
+        return False
+    tool_calls = extract_langfuse_tool_calls(response_data)
+    if not tool_calls:
+        return False
+    return any(
+        call.get("name") == "theorem_search"
+        and call.get("metadata", {}).get("source") == "candidates"
+        and not call.get("output")
+        for call in tool_calls
+    )
+
+
+async def finalize_empty_mcp_response(
+    *,
+    async_client,
+    types,
+    model: str,
+    thinking_config,
+    max_output_tokens: int,
+    prompt: str,
+    tex_upload,
+    bib_upload,
+    search_response,
+    search_response_data: dict[str, Any],
+):
+    tool_calls = extract_langfuse_tool_calls(search_response_data)
+    final_prompt = build_mcp_finalizer_prompt(prompt, tool_calls)
+    config = types.GenerateContentConfig(
+        system_instruction=(
+            "External tool use is finished. Do not call tools. Return exactly one "
+            "JSON object and no extra commentary."
+        ),
+        max_output_tokens=max_output_tokens,
+        thinking_config=thinking_config,
+    )
+    final_response = await async_client.models.generate_content(
+        model=model,
+        contents=[final_prompt, tex_upload, bib_upload],
+        config=config,
+    )
+    final_response_data = to_dict(final_response)
+    final_response_data["gemini_mcp_finalized_after_empty_tool_response"] = True
+    final_response_data["gemini_mcp_search_response_id"] = read_response_id(
+        search_response_data
+    )
+    final_response_data["gemini_mcp_search_response_status"] = read_response_status(
+        search_response_data
+    )
+    final_response_data["langfuse_tool_calls"] = tool_calls
+    final_response_data["langfuse_usage_details"] = combine_usage_details(
+        extract_langfuse_usage_details(search_response, search_response_data),
+        extract_langfuse_usage_details(final_response, final_response_data),
+    )
+    return final_response, final_response_data
+
+
+def build_mcp_finalizer_prompt(
+    prompt: str,
+    tool_calls: list[dict[str, Any]],
+) -> str:
+    return (
+        f"{prompt.rstrip()}\n\n"
+        "The previous attempt used theorem_search but ended with another tool call "
+        "instead of a final answer. Tool use is now disabled. Use the attached files "
+        "and the compact theorem_search transcript below. Return JSON only with "
+        'exactly {"ai_id": <string or null>, "ai_num": <string or null>}. '
+        "If no exact match is proven, use the best-supported guess from the search "
+        "results rather than leaving both fields null.\n\n"
+        "Compact theorem_search transcript:\n"
+        f"{format_mcp_tool_call_summary(tool_calls)}"
+    )
+
+
+def format_mcp_tool_call_summary(tool_calls: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for index, call in enumerate(
+        tool_calls[:GEMINI_MCP_FINALIZER_TOOL_CALL_LIMIT],
+        start=1,
+    ):
+        query = normalize_summary_text(call.get("query")) or normalize_summary_text(
+            call.get("input")
+        )
+        lines.append(f"{index}. theorem_search query: {query or '(unknown query)'}")
+        theorems = extract_theorem_results_from_tool_call(call)
+        if not theorems:
+            lines.append("   results: none recorded")
+            continue
+        for result_index, theorem in enumerate(
+            theorems[:GEMINI_MCP_FINALIZER_RESULT_LIMIT],
+            start=1,
+        ):
+            paper = theorem.get("paper") if isinstance(theorem.get("paper"), dict) else {}
+            paper_id = normalize_summary_text(paper.get("paper_id"))
+            title = normalize_summary_text(paper.get("title"))
+            name = normalize_summary_text(theorem.get("name"))
+            score = theorem.get("score", theorem.get("similarity"))
+            body = normalize_summary_text(theorem.get("body"))
+            lines.append(
+                "   "
+                f"{result_index}) {paper_id or 'unknown arXiv'} "
+                f"{name or 'unknown result'}"
+                + (f" score={score}" if score is not None else "")
+                + (f" title={title}" if title else "")
+            )
+            if body:
+                lines.append(
+                    "      body: "
+                    + truncate_summary_text(body, GEMINI_MCP_FINALIZER_TEXT_LIMIT)
+                )
+    return "\n".join(lines) if lines else "(no theorem_search calls recorded)"
+
+
+def extract_theorem_results_from_tool_call(call: dict[str, Any]) -> list[dict[str, Any]]:
+    output = call.get("output")
+    if not isinstance(output, dict):
+        return []
+    result = output.get("result")
+    if not isinstance(result, dict):
+        return []
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict) and isinstance(structured.get("theorems"), list):
+        return [
+            theorem
+            for theorem in structured["theorems"]
+            if isinstance(theorem, dict)
+        ]
+
+    content = result.get("content")
+    if not isinstance(content, list):
+        return []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, dict) and isinstance(text.get("theorems"), list):
+            return [
+                theorem
+                for theorem in text["theorems"]
+                if isinstance(theorem, dict)
+            ]
+        if not isinstance(text, str):
+            continue
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("theorems"), list):
+            return [
+                theorem
+                for theorem in data["theorems"]
+                if isinstance(theorem, dict)
+            ]
+    return []
+
+
+def normalize_summary_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return truncate_summary_text(
+            json.dumps(value, ensure_ascii=False, default=str),
+            GEMINI_MCP_FINALIZER_TEXT_LIMIT,
+        )
+    return str(value).strip()
+
+
+def truncate_summary_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
+def read_response_id(response_data: dict[str, Any]) -> str | None:
+    value = response_data.get("id") or response_data.get("response_id")
+    return str(value) if value else None
+
+
+def read_response_status(response_data: dict[str, Any]) -> str | None:
+    value = response_data.get("status")
+    if value:
+        return str(value)
+    candidates = response_data.get("candidates")
+    if isinstance(candidates, list):
+        finish_reasons = [
+            str(candidate.get("finish_reason") or candidate.get("finishReason"))
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and (candidate.get("finish_reason") or candidate.get("finishReason"))
+        ]
+        if finish_reasons:
+            return ",".join(finish_reasons)
+    return None
+
+
+def combine_usage_details(*usage_details_items: dict[str, int]) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for usage_details in usage_details_items:
+        for key, value in usage_details.items():
+            try:
+                numeric_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            combined[key] = combined.get(key, 0) + numeric_value
+    return combined
 
 
 def extract_output_text(response, response_data: dict[str, Any]) -> str:
@@ -655,6 +884,17 @@ def extract_output_text(response, response_data: dict[str, Any]) -> str:
 
 
 def extract_langfuse_usage_details(response, response_data: dict[str, Any]) -> dict[str, int]:
+    explicit_usage = response_data.get("langfuse_usage_details")
+    if isinstance(explicit_usage, dict):
+        cleaned_usage: dict[str, int] = {}
+        for key, value in explicit_usage.items():
+            try:
+                cleaned_usage[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        if cleaned_usage:
+            return cleaned_usage
+
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
         usage = response_data.get("usage_metadata")
