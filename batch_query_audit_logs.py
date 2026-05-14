@@ -484,6 +484,7 @@ def build_item_prompt(
         f"{retrieval_instruction}\n\n"
         "Return JSON only, with exactly this shape for the arXiv id and the theorem name/number:\n"
         '{"ai_id": <string or null>, "ai_num": <string or null>}'
+        "Include no extra commentary, just the JSON."
     )
     instruction = (
         f"{user_prompt.strip()}\n\n{retrieval_instruction}"
@@ -491,7 +492,7 @@ def build_item_prompt(
         else default_instruction
     )
     return (
-        "Analyze one logged theorem-style citation occurrence in the attached LaTeX source and bibliography. Include no extra commentary.\n\n"
+        "Analyze one logged theorem-style citation occurrence in the attached LaTeX source and bibliography.\n\n"
         f"Log file: {log_name}\n"
         f"Log item: {record_index}\n"
         f"Logged source line number: {line_number}\n\n"
