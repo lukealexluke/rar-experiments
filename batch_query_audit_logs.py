@@ -480,7 +480,7 @@ def build_item_prompt(
         "1. Identify the external arXiv identifier of the cited source paper containing the missing result.\n"
         '2. Identify the cited theorem-like result name/number, for example "Theorem 1.2" or "Proposition 3.4".\n'
         f"{retrieval_instruction}\n\n"
-        "Return JSON only, with exactly this shape:\n"
+        "Return JSON only, with exactly this shape for the arXiv id and the theorem name/number:\n"
         '{"ai_id": <string or null>, "ai_num": <string or null>}'
     )
     instruction = (
