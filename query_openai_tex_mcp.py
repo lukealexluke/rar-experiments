@@ -2009,17 +2009,23 @@ def extract_query_from_tool_value(value: Any) -> str:
     value = coerce_json_value(value)
     if isinstance(value, str):
         return value.strip()
+    if isinstance(value, list):
+        queries = [normalize_langfuse_scalar(item) for item in value]
+        queries = [query for query in queries if query]
+        return " | ".join(queries)
     if isinstance(value, dict):
         for key in (
             "query",
+            "queries",
             "search_query",
+            "search_queries",
             "searchQuery",
             "q",
             "text",
             "statement",
             "keywords",
         ):
-            found = normalize_langfuse_scalar(value.get(key))
+            found = extract_query_from_tool_value(value.get(key))
             if found:
                 return found
         for nested_key in ("input", "arguments", "parameters", "action"):
@@ -2324,6 +2330,8 @@ def run_response(
     }
     if tools:
         request["tools"] = tools
+    if retrieval_mode == "web-search":
+        request["include"] = ["web_search_call.action.sources"]
     response = client.responses.create(**request)
 
     response_data = to_dict(response)
