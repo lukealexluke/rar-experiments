@@ -484,7 +484,8 @@ def build_item_prompt(
         f"{retrieval_instruction}\n\n"
         "Return JSON only, with exactly this shape for the arXiv id and the theorem name/number:\n"
         '{"ai_id": <string or null>, "ai_num": <string or null>}\n'
-        "Include no extra commentary, just the JSON."
+        "Include no extra commentary, just the JSON.\n"
+        "If you can't find an exact match, use your best guess instead."
     )
     instruction = (
         f"{user_prompt.strip()}\n\n{retrieval_instruction}"
