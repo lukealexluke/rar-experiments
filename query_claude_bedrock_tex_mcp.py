@@ -64,6 +64,9 @@ DEFAULT_MCP_READ_TIMEOUT = 300.0
 DEFAULT_CLAUDE_INPUT_COST_ENV = "CLAUDE_BEDROCK_INPUT_COST_PER_1M"
 DEFAULT_CLAUDE_CACHED_INPUT_COST_ENV = "CLAUDE_BEDROCK_CACHED_INPUT_COST_PER_1M"
 DEFAULT_CLAUDE_OUTPUT_COST_ENV = "CLAUDE_BEDROCK_OUTPUT_COST_PER_1M"
+DEFAULT_CLAUDE_JSON_FINALIZER_MAX_OUTPUT_TOKENS = 1024
+CLAUDE_JSON_SOURCE_OUTPUT_TEXT_LIMIT = 4000
+REQUIRED_AUDIT_JSON_KEYS = ("ai_id", "ai_num")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -544,6 +547,14 @@ async def _run_response_async(
 
                     tool_uses = extract_tool_uses(response_message)
                     if not tool_uses:
+                        if prompt_requests_required_audit_json(prompt):
+                            response, response_data = ensure_required_json_response(
+                                client=client,
+                                model=model,
+                                max_output_tokens=max_output_tokens,
+                                response=response,
+                                response_data=response_data,
+                            )
                         response_data["mcp_available_tools"] = available_tool_names
                         response_data["mcp_tool_rounds"] = tool_rounds
                         response_data["langfuse_tool_calls"] = mcp_tool_calls
@@ -682,17 +693,19 @@ def converse(
     client: BedrockClientHandle,
     model: str,
     messages: list[dict[str, Any]],
-    tool_specs: list[dict[str, Any]],
+    tool_specs: list[dict[str, Any]] | None,
     max_output_tokens: int,
-    additional_model_request_fields: dict[str, Any],
+    additional_model_request_fields: dict[str, Any] | None,
+    system_prompt: str | None = None,
 ) -> dict[str, Any]:
     request: dict[str, Any] = {
         "modelId": model,
         "messages": messages,
-        "system": [{"text": build_system_prompt()}],
+        "system": [{"text": system_prompt or build_system_prompt()}],
         "inferenceConfig": {"maxTokens": max_output_tokens},
-        "toolConfig": {"tools": tool_specs},
     }
+    if tool_specs:
+        request["toolConfig"] = {"tools": tool_specs}
     if additional_model_request_fields:
         request["additionalModelRequestFields"] = additional_model_request_fields
     try:
@@ -711,6 +724,231 @@ def normalize_bedrock_response(response: dict[str, Any]) -> dict[str, Any]:
     elif stop_reason:
         response_data["status"] = stop_reason
     return response_data
+
+
+def prompt_requests_required_audit_json(prompt: str) -> bool:
+    return all(f'"{key}"' in prompt for key in REQUIRED_AUDIT_JSON_KEYS)
+
+
+def ensure_required_json_response(
+    *,
+    client: BedrockClientHandle,
+    model: str,
+    max_output_tokens: int,
+    response: dict[str, Any],
+    response_data: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    output_text = extract_output_text(response, response_data)
+    normalized_text = normalize_required_audit_json_text(output_text)
+    if normalized_text is not None:
+        if (
+            not is_bare_required_audit_json_output(output_text)
+            or normalized_text != output_text.strip()
+        ):
+            rewrite_response_output_text(response_data, normalized_text)
+            annotate_json_rewrite(
+                response_data=response_data,
+                source_output_text=output_text,
+                flag_name="claude_json_normalized_after_non_json_text",
+            )
+        return response, response_data
+
+    return finalize_required_json_response(
+        client=client,
+        model=model,
+        max_output_tokens=max_output_tokens,
+        source_response=response,
+        source_response_data=response_data,
+        source_output_text=output_text,
+    )
+
+
+def finalize_required_json_response(
+    *,
+    client: BedrockClientHandle,
+    model: str,
+    max_output_tokens: int,
+    source_response: dict[str, Any],
+    source_response_data: dict[str, Any],
+    source_output_text: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source_usage = extract_langfuse_usage_details(source_response, source_response_data)
+    final_response = converse(
+        client=client,
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"text": build_required_json_finalizer_prompt(source_output_text)}
+                ],
+            }
+        ],
+        tool_specs=None,
+        max_output_tokens=min(
+            max_output_tokens,
+            DEFAULT_CLAUDE_JSON_FINALIZER_MAX_OUTPUT_TOKENS,
+        ),
+        additional_model_request_fields=None,
+        system_prompt=build_required_json_finalizer_system_prompt(),
+    )
+    final_response_data = normalize_bedrock_response(final_response)
+    final_output_text = extract_output_text(final_response, final_response_data)
+    normalized_text = normalize_required_audit_json_text(final_output_text)
+    finalizer_parse_failed = normalized_text is None
+    if normalized_text is None:
+        normalized_text = render_required_audit_json_object({"ai_id": None, "ai_num": None})
+
+    rewrite_response_output_text(final_response_data, normalized_text)
+    annotate_json_rewrite(
+        response_data=final_response_data,
+        source_output_text=source_output_text,
+        flag_name="claude_json_finalized_after_non_json_text",
+    )
+    final_response_data["claude_json_source_response_status"] = source_response_data.get(
+        "status"
+    )
+    if finalizer_parse_failed:
+        final_response_data["claude_json_finalizer_parse_failed"] = True
+        final_response_data["claude_json_finalizer_output_text"] = truncate_text(
+            final_output_text,
+            CLAUDE_JSON_SOURCE_OUTPUT_TEXT_LIMIT,
+        )
+
+    finalizer_usage = extract_langfuse_usage_details(final_response, final_response_data)
+    combined_usage = combine_langfuse_usage_details(source_usage, finalizer_usage)
+    if combined_usage:
+        final_response_data["langfuse_usage_details"] = combined_usage
+    return final_response, final_response_data
+
+
+def build_required_json_finalizer_system_prompt() -> str:
+    return (
+        "You are a strict JSON finalizer. Return exactly one JSON object. "
+        "Do not include markdown, code fences, prose, analysis, or explanations."
+    )
+
+
+def build_required_json_finalizer_prompt(source_output_text: str) -> str:
+    previous_answer = source_output_text.strip() or "(empty response)"
+    return (
+        "Rewrite the previous assistant answer as exactly one JSON object with this schema:\n"
+        '{"ai_id": <string or null>, "ai_num": <string or null>}\n\n'
+        "Rules:\n"
+        "- Preserve the answer values already given by the previous assistant answer.\n"
+        "- Use null for a value that is unknown, unavailable, or already null.\n"
+        "- Return no markdown, no code fence, and no surrounding text.\n\n"
+        "Previous assistant answer:\n"
+        f"{truncate_text(previous_answer, CLAUDE_JSON_SOURCE_OUTPUT_TEXT_LIMIT)}"
+    )
+
+
+def normalize_required_audit_json_text(output_text: str) -> str | None:
+    value = parse_bare_json_value(output_text)
+    if has_required_audit_json_fields(value):
+        return render_required_audit_json_object(value)
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(output_text):
+        if char != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(output_text[index:])
+        except json.JSONDecodeError:
+            continue
+        if has_required_audit_json_fields(value):
+            return render_required_audit_json_object(value)
+    return None
+
+
+def is_bare_required_audit_json_output(output_text: str) -> bool:
+    stripped = output_text.strip()
+    if not stripped:
+        return False
+    decoder = json.JSONDecoder()
+    try:
+        value, end_index = decoder.raw_decode(stripped)
+    except json.JSONDecodeError:
+        return False
+    if stripped[end_index:].strip():
+        return False
+    return has_exact_required_audit_json_shape(value)
+
+
+def parse_bare_json_value(output_text: str) -> Any:
+    stripped = output_text.strip()
+    if not stripped:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        value, end_index = decoder.raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    if stripped[end_index:].strip():
+        return None
+    return value
+
+
+def has_required_audit_json_fields(value: Any) -> bool:
+    return isinstance(value, dict) and all(key in value for key in REQUIRED_AUDIT_JSON_KEYS)
+
+
+def has_exact_required_audit_json_shape(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if set(value) != set(REQUIRED_AUDIT_JSON_KEYS):
+        return False
+    return all(
+        value[key] is None or isinstance(value[key], str)
+        for key in REQUIRED_AUDIT_JSON_KEYS
+    )
+
+
+def render_required_audit_json_object(value: dict[str, Any]) -> str:
+    rendered = {
+        key: coerce_required_json_value(value.get(key))
+        for key in REQUIRED_AUDIT_JSON_KEYS
+    }
+    return json.dumps(rendered, ensure_ascii=False, separators=(", ", ": "))
+
+
+def coerce_required_json_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def rewrite_response_output_text(response_data: dict[str, Any], output_text: str) -> None:
+    output = response_data.get("output")
+    if not isinstance(output, dict):
+        output = {}
+        response_data["output"] = output
+    message = output.get("message")
+    if not isinstance(message, dict):
+        message = {"role": "assistant"}
+        output["message"] = message
+    message["content"] = [{"text": output_text}]
+
+
+def annotate_json_rewrite(
+    *,
+    response_data: dict[str, Any],
+    source_output_text: str,
+    flag_name: str,
+) -> None:
+    response_data[flag_name] = True
+    response_data["claude_json_source_output_text"] = truncate_text(
+        source_output_text,
+        CLAUDE_JSON_SOURCE_OUTPUT_TEXT_LIMIT,
+    )
+
+
+def truncate_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: max(limit - 20, 0)].rstrip() + "\n... [truncated]"
 
 
 def extract_tool_uses(response_message: Any) -> list[dict[str, Any]]:
@@ -844,6 +1082,18 @@ def extract_output_text(response, response_data: dict[str, Any]) -> str:
 
 
 def extract_langfuse_usage_details(response, response_data: dict[str, Any]) -> dict[str, int]:
+    explicit_usage = response_data.get("langfuse_usage_details")
+    if isinstance(explicit_usage, dict):
+        usage_details: dict[str, int] = {}
+        for key, value in explicit_usage.items():
+            if value is None:
+                continue
+            try:
+                usage_details[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return usage_details
+
     usage = response_data.get("usage")
     if not isinstance(usage, dict):
         return {}
@@ -866,6 +1116,24 @@ def extract_langfuse_usage_details(response, response_data: dict[str, Any]) -> d
         usage_details["cached_input"] = cached_tokens
         usage_details["uncached_input"] = max(input_tokens - cached_tokens, 0) if input_tokens else 0
     return usage_details
+
+
+def combine_langfuse_usage_details(*usage_items: dict[str, int]) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for usage in usage_items:
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if value is None:
+                continue
+            try:
+                numeric_value = int(value)
+            except (TypeError, ValueError):
+                continue
+            combined[key] = combined.get(key, 0) + numeric_value
+    if "total" not in combined and ("input" in combined or "output" in combined):
+        combined["total"] = combined.get("input", 0) + combined.get("output", 0)
+    return combined
 
 
 def read_usage_int(container: dict[str, Any], field_name: str) -> int | None:
