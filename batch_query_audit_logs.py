@@ -483,7 +483,7 @@ def build_item_prompt(
         '2. Identify the cited theorem-like result name/number, for example "Theorem 1.2" or "Proposition 3.4".\n'
         f"{retrieval_instruction}\n\n"
         "Return JSON only, with exactly this shape for the arXiv id and the theorem name/number:\n"
-        '{"ai_id": <string or null>, "ai_num": <string or null>}'
+        '{"ai_id": <string or null>, "ai_num": <string or null>}\n'
         "Include no extra commentary, just the JSON."
     )
     instruction = (
