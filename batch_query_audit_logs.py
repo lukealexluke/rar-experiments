@@ -491,7 +491,7 @@ def build_item_prompt(
         else default_instruction
     )
     return (
-        "Analyze one logged theorem-style citation occurrence in the attached LaTeX source and bibliography.\n\n"
+        "Analyze one logged theorem-style citation occurrence in the attached LaTeX source and bibliography. Include no extra commentary.\n\n"
         f"Log file: {log_name}\n"
         f"Log item: {record_index}\n"
         f"Logged source line number: {line_number}\n\n"
