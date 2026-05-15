@@ -77,11 +77,11 @@ PROVIDER_RUNTIMES: dict[str, ProviderRuntime] = {
     ),
     "claude": ProviderRuntime(
         name="claude",
-        label="Claude Bedrock",
+        label="Claude",
         module=claude_query,
-        generation_observation_name="bedrock-runtime.converse",
-        default_output_log_name="claude_bedrock_query_results.csv",
-        default_raw_response_dir_name="raw_claude_bedrock_responses",
+        generation_observation_name="anthropic.messages.create",
+        default_output_log_name="claude_query_results.csv",
+        default_raw_response_dir_name="raw_claude_responses",
     ),
 }
 
@@ -215,41 +215,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Environment variable containing the provider API key. Defaults to the "
             "selected provider's default value."
-        ),
-    )
-    parser.add_argument(
-        "--aws-region",
-        help=(
-            "AWS region for --provider claude. Defaults to AWS_REGION, "
-            "AWS_DEFAULT_REGION, or us-east-1."
-        ),
-    )
-    parser.add_argument(
-        "--aws-profile",
-        help="Optional AWS profile name for --provider claude.",
-    )
-    parser.add_argument(
-        "--bedrock-endpoint-url",
-        help="Optional custom bedrock-runtime endpoint URL for --provider claude.",
-    )
-    parser.add_argument(
-        "--bedrock-connect-timeout",
-        type=float,
-        default=claude_query.DEFAULT_BEDROCK_CONNECT_TIMEOUT,
-        metavar="SECONDS",
-        help=(
-            "Bedrock connect timeout for --provider claude. Defaults to "
-            f"{claude_query.DEFAULT_BEDROCK_CONNECT_TIMEOUT:g} seconds."
-        ),
-    )
-    parser.add_argument(
-        "--bedrock-read-timeout",
-        type=float,
-        default=claude_query.DEFAULT_BEDROCK_READ_TIMEOUT,
-        metavar="SECONDS",
-        help=(
-            "Bedrock read timeout for --provider claude. Defaults to "
-            f"{claude_query.DEFAULT_BEDROCK_READ_TIMEOUT:g} seconds."
         ),
     )
     parser.add_argument(
@@ -1252,7 +1217,7 @@ def run_provider_response(
     if provider_runtime.name == "claude":
         if args.retrieval_mode != "mcp":
             raise RuntimeError(
-                "Claude Bedrock in this script currently supports retrieval-mode=mcp only. "
+                "Claude in this script currently supports retrieval-mode=mcp only. "
                 "Use provider=openai or provider=gemini for native web search, or "
                 "use --retrieval-mode mcp for Claude."
             )
@@ -1268,6 +1233,7 @@ def run_provider_response(
             mcp_url=args.mcp_url,
             requested_tools=args.mcp_tools or list(DEFAULT_ALLOWED_MCP_TOOLS),
             mcp_headers=mcp_headers,
+            mcp_read_timeout=args.mcp_read_timeout,
         )
         if thinking_note:
             print(thinking_note, file=sys.stderr)
@@ -1289,7 +1255,7 @@ def main() -> int:
     args = apply_provider_defaults(args, provider_runtime)
     if provider_runtime.name == "claude" and args.retrieval_mode != "mcp":
         print(
-            "Error: Claude Bedrock in this script currently supports "
+            "Error: Claude in this script currently supports "
             "retrieval-mode=mcp only. Use --provider openai or --provider gemini "
             "for native web search.",
             file=sys.stderr,

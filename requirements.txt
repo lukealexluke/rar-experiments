@@ -1,7 +1,7 @@
 # Python dependencies used by the scripts in this repo.
 
 arxiv
-boto3
+anthropic
 mcp
 google-genai
 openai
@@ -9,5 +9,5 @@ plasTeX
 python-dotenv
 modelcontextprotocol
 
-# Optional tracing support for query_openai_tex_mcp.py and query_gemini_tex_mcp.py.
+# Optional tracing support for provider query scripts.
 langfuse

@@ -54,16 +54,16 @@ from query_openai_tex_mcp import (
 from statement_reference_audit import read_candidate_text
 
 
-DEFAULT_API_KEY_ENV = ""
-DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+DEFAULT_API_KEY_ENV = "ANTHROPIC_API_KEY"
+DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 DEFAULT_REASONING_EFFORT = "medium"
-DEFAULT_AWS_REGION = "us-east-1"
-DEFAULT_BEDROCK_CONNECT_TIMEOUT = 30.0
-DEFAULT_BEDROCK_READ_TIMEOUT = 600.0
 DEFAULT_MCP_READ_TIMEOUT = 300.0
-DEFAULT_CLAUDE_INPUT_COST_ENV = "CLAUDE_BEDROCK_INPUT_COST_PER_1M"
-DEFAULT_CLAUDE_CACHED_INPUT_COST_ENV = "CLAUDE_BEDROCK_CACHED_INPUT_COST_PER_1M"
-DEFAULT_CLAUDE_OUTPUT_COST_ENV = "CLAUDE_BEDROCK_OUTPUT_COST_PER_1M"
+DEFAULT_CLAUDE_INPUT_COST_ENV = "CLAUDE_INPUT_COST_PER_1M"
+DEFAULT_CLAUDE_CACHED_INPUT_COST_ENV = "CLAUDE_CACHED_INPUT_COST_PER_1M"
+DEFAULT_CLAUDE_OUTPUT_COST_ENV = "CLAUDE_OUTPUT_COST_PER_1M"
+LEGACY_CLAUDE_INPUT_COST_ENV = "CLAUDE_BEDROCK_INPUT_COST_PER_1M"
+LEGACY_CLAUDE_CACHED_INPUT_COST_ENV = "CLAUDE_BEDROCK_CACHED_INPUT_COST_PER_1M"
+LEGACY_CLAUDE_OUTPUT_COST_ENV = "CLAUDE_BEDROCK_OUTPUT_COST_PER_1M"
 DEFAULT_CLAUDE_JSON_FINALIZER_MAX_OUTPUT_TOKENS = 1024
 CLAUDE_JSON_SOURCE_OUTPUT_TEXT_LIMIT = 4000
 REQUIRED_AUDIT_JSON_KEYS = ("ai_id", "ai_num")
@@ -71,20 +71,18 @@ TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @dataclass
-class BedrockClientHandle:
-    runtime_client: Any
-    region_name: str
-    profile_name: str | None = None
-    endpoint_url: str | None = None
+class ClaudeClientHandle:
+    messages_client: Any
+    api_key_env: str = DEFAULT_API_KEY_ENV
 
     def close(self) -> None:
-        close = getattr(self.runtime_client, "close", None)
+        close = getattr(self.messages_client, "close", None)
         if callable(close):
             close()
 
 
 @dataclass(frozen=True)
-class BedrockFileRef:
+class ClaudeFileRef:
     path: Path
     name: str
     text: str
@@ -93,8 +91,8 @@ class BedrockFileRef:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Send a .tex file and bibliography source to Claude through Amazon "
-            "Bedrock, and let the model use the TheoremSearch MCP server."
+            "Send a .tex file and bibliography source to Claude through the "
+            "Anthropic API, and let the model use the TheoremSearch MCP server."
         )
     )
     parser.add_argument("tex_file", type=Path, help="Path to the LaTeX source file.")
@@ -145,8 +143,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=DEFAULT_MODEL,
         help=(
-            "Bedrock model or inference profile ID to use. Claude Sonnet 4.5 "
-            f"requires an inference profile for on-demand use. Defaults to {DEFAULT_MODEL}."
+            "Anthropic Claude model ID to use. "
+            f"Defaults to {DEFAULT_MODEL}."
         ),
     )
     parser.add_argument(
@@ -168,39 +166,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--aws-region",
-        default=default_aws_region(),
+        "--api-key-env",
+        default=DEFAULT_API_KEY_ENV,
         help=(
-            "AWS region for the bedrock-runtime client. Defaults to AWS_REGION, "
-            f"AWS_DEFAULT_REGION, or {DEFAULT_AWS_REGION}."
-        ),
-    )
-    parser.add_argument(
-        "--aws-profile",
-        help="Optional AWS profile name. Defaults to AWS_PROFILE or the SDK default chain.",
-    )
-    parser.add_argument(
-        "--bedrock-endpoint-url",
-        help="Optional custom bedrock-runtime endpoint URL.",
-    )
-    parser.add_argument(
-        "--bedrock-connect-timeout",
-        type=float,
-        default=DEFAULT_BEDROCK_CONNECT_TIMEOUT,
-        metavar="SECONDS",
-        help=(
-            "Bedrock client connect timeout in seconds. "
-            f"Defaults to {DEFAULT_BEDROCK_CONNECT_TIMEOUT:g}."
-        ),
-    )
-    parser.add_argument(
-        "--bedrock-read-timeout",
-        type=float,
-        default=DEFAULT_BEDROCK_READ_TIMEOUT,
-        metavar="SECONDS",
-        help=(
-            "Bedrock client read timeout in seconds. "
-            f"Defaults to {DEFAULT_BEDROCK_READ_TIMEOUT:g}."
+            "Environment variable containing the Anthropic API key. "
+            f"Defaults to {DEFAULT_API_KEY_ENV}."
         ),
     )
     parser.add_argument(
@@ -282,26 +252,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--json-output",
         type=Path,
-        help="Optional path to write the final Bedrock response JSON.",
+        help="Optional path to write the final Claude response JSON.",
     )
     parser.add_argument(
         "--delete-uploads",
         action="store_true",
-        help="Accepted for CLI parity; Bedrock Converse does not create uploaded files.",
+        help="Accepted for CLI parity; Claude text uploads are local-only.",
     )
     return parser.parse_args()
 
 
-def default_aws_region() -> str:
-    return (
-        os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or DEFAULT_AWS_REGION
-    )
-
-
 def create_upload_temp_dir() -> Path:
-    base_dir = (Path.cwd() / ".bedrock_upload_tmp").resolve()
+    base_dir = (Path.cwd() / ".claude_upload_tmp").resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = base_dir / f"tex-mcp-upload-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     temp_dir.mkdir()
@@ -324,15 +286,18 @@ def resolve_model_pricing(args: argparse.Namespace) -> ModelPricing | None:
     input_cost = coalesce_float(
         args.input_cost_per_1m,
         read_optional_float_env(DEFAULT_CLAUDE_INPUT_COST_ENV),
+        read_optional_float_env(LEGACY_CLAUDE_INPUT_COST_ENV),
     )
     cached_input_cost = coalesce_float(
         args.cached_input_cost_per_1m,
         read_optional_float_env(DEFAULT_CLAUDE_CACHED_INPUT_COST_ENV),
+        read_optional_float_env(LEGACY_CLAUDE_CACHED_INPUT_COST_ENV),
         input_cost,
     )
     output_cost = coalesce_float(
         args.output_cost_per_1m,
         read_optional_float_env(DEFAULT_CLAUDE_OUTPUT_COST_ENV),
+        read_optional_float_env(LEGACY_CLAUDE_OUTPUT_COST_ENV),
     )
 
     if input_cost is None or cached_input_cost is None or output_cost is None:
@@ -357,26 +322,23 @@ def resolve_model_pricing(args: argparse.Namespace) -> ModelPricing | None:
 
 def ensure_runtime_dependencies() -> None:
     try:
-        import boto3  # noqa: F401
+        import anthropic  # noqa: F401
         import httpx  # noqa: F401
         from mcp import ClientSession  # noqa: F401
         from mcp.client.streamable_http import streamable_http_client  # noqa: F401
     except ImportError as exc:
         raise RuntimeError(
-            "The Claude Bedrock path requires `boto3`, `httpx`, and `mcp`. "
-            "Install them with `pip install boto3 httpx mcp`."
+            "The Claude API path requires `anthropic`, `httpx`, and `mcp`. "
+            "Install them with `pip install anthropic httpx mcp`."
         ) from exc
 
 
 def make_client_from_args(args: argparse.Namespace, *, enable_langfuse: bool):
+    api_key_env = getattr(args, "api_key_env", None) or DEFAULT_API_KEY_ENV
     return make_client(
-        None,
+        read_api_key_from_env(api_key_env),
         enable_langfuse=enable_langfuse,
-        region_name=args.aws_region,
-        profile_name=args.aws_profile,
-        endpoint_url=args.bedrock_endpoint_url,
-        connect_timeout=args.bedrock_connect_timeout,
-        read_timeout=args.bedrock_read_timeout,
+        api_key_env=api_key_env,
     )
 
 
@@ -384,52 +346,31 @@ def make_client(
     api_key: str | None = None,
     *,
     enable_langfuse: bool,
-    region_name: str | None = None,
-    profile_name: str | None = None,
-    endpoint_url: str | None = None,
-    connect_timeout: float = DEFAULT_BEDROCK_CONNECT_TIMEOUT,
-    read_timeout: float = DEFAULT_BEDROCK_READ_TIMEOUT,
+    api_key_env: str = DEFAULT_API_KEY_ENV,
 ):
     try:
-        import boto3
-        from botocore.config import Config
+        from anthropic import Anthropic
     except ImportError as exc:
         raise RuntimeError(
-            "The `boto3`/`botocore` packages are not installed. Install them with "
-            "`pip install boto3` and rerun the script."
+            "The `anthropic` package is not installed. Install it with "
+            "`pip install anthropic` and rerun the script."
         ) from exc
 
-    region = region_name or default_aws_region()
-    profile = profile_name or os.environ.get("AWS_PROFILE") or None
-    try:
-        session = (
-            boto3.Session(profile_name=profile, region_name=region)
-            if profile
-            else boto3.Session(region_name=region)
-        )
-        client_kwargs: dict[str, Any] = {
-            "config": Config(
-                connect_timeout=connect_timeout,
-                read_timeout=read_timeout,
-                retries={"max_attempts": 3, "mode": "standard"},
-            )
-        }
-        if endpoint_url:
-            client_kwargs["endpoint_url"] = endpoint_url
-        runtime_client = session.client("bedrock-runtime", **client_kwargs)
-    except Exception as exc:
-        raise RuntimeError(f"Could not create a Bedrock Runtime client: {exc}") from exc
+    if not api_key:
+        raise RuntimeError(f"Missing Anthropic API key in environment variable {api_key_env}.")
 
-    return BedrockClientHandle(
-        runtime_client=runtime_client,
-        region_name=region,
-        profile_name=profile,
-        endpoint_url=endpoint_url,
-    )
+    return ClaudeClientHandle(messages_client=Anthropic(api_key=api_key), api_key_env=api_key_env)
 
 
-def upload_file(client, path: Path) -> BedrockFileRef:
-    return BedrockFileRef(
+def read_api_key_from_env(api_key_env: str) -> str:
+    api_key = os.environ.get(api_key_env, "").strip()
+    if not api_key:
+        raise RuntimeError(f"Missing Anthropic API key in environment variable {api_key_env}.")
+    return api_key
+
+
+def upload_file(client, path: Path) -> ClaudeFileRef:
+    return ClaudeFileRef(
         path=path.resolve(),
         name=path.name,
         text=read_candidate_text(path),
@@ -441,13 +382,13 @@ def cleanup_uploaded_files(client, uploaded_file_names: list[str]) -> None:
 
 
 def run_response(
-    client: BedrockClientHandle,
+    client: ClaudeClientHandle,
     model: str,
     reasoning_effort: str,
     max_output_tokens: int,
     prompt: str,
-    tex_upload: BedrockFileRef,
-    bib_upload: BedrockFileRef,
+    tex_upload: ClaudeFileRef,
+    bib_upload: ClaudeFileRef,
     mcp_label: str,
     mcp_url: str,
     requested_tools: list[str],
@@ -473,13 +414,13 @@ def run_response(
 
 
 async def _run_response_async(
-    client: BedrockClientHandle,
+    client: ClaudeClientHandle,
     model: str,
     reasoning_effort: str,
     max_output_tokens: int,
     prompt: str,
-    tex_upload: BedrockFileRef,
-    bib_upload: BedrockFileRef,
+    tex_upload: ClaudeFileRef,
+    bib_upload: ClaudeFileRef,
     mcp_label: str,
     mcp_url: str,
     requested_tools: list[str],
@@ -492,7 +433,7 @@ async def _run_response_async(
         from mcp.client.streamable_http import streamable_http_client
     except ImportError as exc:
         raise RuntimeError(
-            "Missing Claude Bedrock runtime dependency. Install `boto3`, `httpx`, and `mcp`."
+            "Missing Claude runtime dependency. Install `anthropic`, `httpx`, and `mcp`."
         ) from exc
 
     http_client = httpx.AsyncClient(
@@ -509,13 +450,13 @@ async def _run_response_async(
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 list_tools_result = await session.list_tools()
-                tool_specs, available_tool_names = build_bedrock_tool_specs(
+                tool_specs, available_tool_names = build_claude_tool_specs(
                     getattr(list_tools_result, "tools", []),
                     requested_tools,
                 )
                 if not tool_specs:
                     raise RuntimeError(
-                        "The MCP session did not expose any requested Bedrock-compatible tools."
+                        "The MCP session did not expose any requested Claude-compatible tools."
                     )
 
                 messages = [
@@ -540,7 +481,7 @@ async def _run_response_async(
                 tool_rounds = 0
                 mcp_tool_calls: list[dict[str, Any]] = []
                 for _ in range(DEFAULT_APPROVAL_LIMIT):
-                    response_data = normalize_bedrock_response(response)
+                    response_data = normalize_claude_response(response)
                     response_message = response_data.get("output", {}).get("message")
                     if isinstance(response_message, dict):
                         messages.append(response_message)
@@ -563,7 +504,7 @@ async def _run_response_async(
                     tool_rounds += 1
                     tool_result_blocks = []
                     for tool_use in tool_uses:
-                        tool_result = await call_mcp_tool_for_bedrock(
+                        tool_result = await call_mcp_tool_for_claude(
                             session=session,
                             tool_use=tool_use,
                             allowed_tool_names=set(available_tool_names),
@@ -571,7 +512,7 @@ async def _run_response_async(
                         )
                         tool_result_blocks.append(tool_result)
                         mcp_tool_calls.append(
-                            build_bedrock_langfuse_tool_call(
+                            build_claude_langfuse_tool_call(
                                 tool_use=tool_use,
                                 tool_result_block=tool_result,
                                 round_index=tool_rounds,
@@ -592,17 +533,17 @@ async def _run_response_async(
 
 def build_initial_user_content(
     prompt: str,
-    tex_upload: BedrockFileRef,
-    bib_upload: BedrockFileRef,
+    tex_upload: ClaudeFileRef,
+    bib_upload: ClaudeFileRef,
 ) -> list[dict[str, str]]:
     return [
-        {"text": prompt},
-        {"text": render_text_file_block("LaTeX source", tex_upload)},
-        {"text": render_text_file_block("Bibliography source", bib_upload)},
+        {"type": "text", "text": prompt},
+        {"type": "text", "text": render_text_file_block("LaTeX source", tex_upload)},
+        {"type": "text", "text": render_text_file_block("Bibliography source", bib_upload)},
     ]
 
 
-def render_text_file_block(label: str, file_ref: BedrockFileRef) -> str:
+def render_text_file_block(label: str, file_ref: ClaudeFileRef) -> str:
     return (
         f"\n\n===== {label}: {file_ref.name} =====\n"
         f"{file_ref.text.rstrip()}\n"
@@ -610,7 +551,7 @@ def render_text_file_block(label: str, file_ref: BedrockFileRef) -> str:
     )
 
 
-def build_bedrock_tool_specs(
+def build_claude_tool_specs(
     mcp_tools: Sequence[Any],
     requested_tools: Sequence[str],
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -625,15 +566,7 @@ def build_bedrock_tool_specs(
 
         schema = read_tool_input_schema(tool)
         description = normalize_tool_description(getattr(tool, "description", ""))
-        tool_specs.append(
-            {
-                "toolSpec": {
-                    "name": name,
-                    "description": description,
-                    "inputSchema": {"json": schema},
-                }
-            }
-        )
+        tool_specs.append({"name": name, "description": description, "input_schema": schema})
         available_tool_names.append(name)
 
     return tool_specs, available_tool_names
@@ -677,7 +610,7 @@ def build_additional_model_request_fields(
     if budget < 1024:
         return {}, (
             "Claude extended thinking disabled because max-output-tokens is too low "
-            "for Bedrock's minimum thinking budget."
+            "for Anthropic's minimum thinking budget."
         )
     note = None
     if budget != requested_budget:
@@ -690,7 +623,7 @@ def build_additional_model_request_fields(
 
 def converse(
     *,
-    client: BedrockClientHandle,
+    client: ClaudeClientHandle,
     model: str,
     messages: list[dict[str, Any]],
     tool_specs: list[dict[str, Any]] | None,
@@ -699,31 +632,88 @@ def converse(
     system_prompt: str | None = None,
 ) -> dict[str, Any]:
     request: dict[str, Any] = {
-        "modelId": model,
+        "model": normalize_anthropic_model_id(model),
         "messages": messages,
-        "system": [{"text": system_prompt or build_system_prompt()}],
-        "inferenceConfig": {"maxTokens": max_output_tokens},
+        "system": system_prompt or build_system_prompt(),
+        "max_tokens": max_output_tokens,
     }
     if tool_specs:
-        request["toolConfig"] = {"tools": tool_specs}
+        request["tools"] = tool_specs
     if additional_model_request_fields:
-        request["additionalModelRequestFields"] = additional_model_request_fields
+        request.update(additional_model_request_fields)
     try:
-        return client.runtime_client.converse(**request)
+        return client.messages_client.messages.create(**request)
     except Exception as exc:
         raise RuntimeError(
-            "Bedrock Converse operation failed: " + format_exception_message(exc)
+            "Anthropic Messages API operation failed: " + format_exception_message(exc)
         ) from exc
 
 
-def normalize_bedrock_response(response: dict[str, Any]) -> dict[str, Any]:
-    response_data = to_dict(response)
-    stop_reason = str(response_data.get("stopReason") or "").strip()
+def normalize_anthropic_model_id(model: str) -> str:
+    model = str(model or "").strip()
+    match = re.fullmatch(r"(?:[a-z]{2}\.)?anthropic\.(.+?)-v\d+:\d+", model)
+    if match:
+        return match.group(1)
+    return model
+
+
+def normalize_claude_response(response: dict[str, Any]) -> dict[str, Any]:
+    raw_response = to_dict(response)
+    stop_reason = str(raw_response.get("stop_reason") or raw_response.get("stopReason") or "").strip()
+    content = raw_response.get("content")
+    if not isinstance(content, list):
+        content = []
+    response_data: dict[str, Any] = {
+        "provider": "claude",
+        "id": raw_response.get("id"),
+        "model": raw_response.get("model"),
+        "role": raw_response.get("role"),
+        "type": raw_response.get("type"),
+        "stop_reason": stop_reason or None,
+        "stopReason": stop_reason or None,
+        "usage": raw_response.get("usage"),
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [normalize_claude_content_block(block) for block in content],
+            }
+        },
+        "raw_response": raw_response,
+    }
     if stop_reason == "end_turn":
         response_data["status"] = "completed"
     elif stop_reason:
         response_data["status"] = stop_reason
     return response_data
+
+
+def normalize_claude_content_block(block: Any) -> dict[str, Any]:
+    if isinstance(block, dict):
+        block_type = block.get("type")
+        if block_type == "text":
+            return {"type": "text", "text": block.get("text", "")}
+        if block_type == "tool_use":
+            return {
+                "type": "tool_use",
+                "id": block.get("id"),
+                "name": block.get("name"),
+                "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+            }
+        return block
+
+    block_type = getattr(block, "type", None)
+    if block_type == "text":
+        return {"type": "text", "text": getattr(block, "text", "")}
+    if block_type == "tool_use":
+        tool_input = getattr(block, "input", None)
+        return {
+            "type": "tool_use",
+            "id": getattr(block, "id", None),
+            "name": getattr(block, "name", None),
+            "input": tool_input if isinstance(tool_input, dict) else safe_serialize_value(tool_input),
+        }
+    serialized = safe_serialize_value(block)
+    return serialized if isinstance(serialized, dict) else {"type": str(block_type or "unknown")}
 
 
 def prompt_requests_required_audit_json(prompt: str) -> bool:
@@ -732,7 +722,7 @@ def prompt_requests_required_audit_json(prompt: str) -> bool:
 
 def ensure_required_json_response(
     *,
-    client: BedrockClientHandle,
+    client: ClaudeClientHandle,
     model: str,
     max_output_tokens: int,
     response: dict[str, Any],
@@ -765,7 +755,7 @@ def ensure_required_json_response(
 
 def finalize_required_json_response(
     *,
-    client: BedrockClientHandle,
+    client: ClaudeClientHandle,
     model: str,
     max_output_tokens: int,
     source_response: dict[str, Any],
@@ -780,7 +770,10 @@ def finalize_required_json_response(
             {
                 "role": "user",
                 "content": [
-                    {"text": build_required_json_finalizer_prompt(source_output_text)}
+                    {
+                        "type": "text",
+                        "text": build_required_json_finalizer_prompt(source_output_text),
+                    }
                 ],
             }
         ],
@@ -792,7 +785,7 @@ def finalize_required_json_response(
         additional_model_request_fields=None,
         system_prompt=build_required_json_finalizer_system_prompt(),
     )
-    final_response_data = normalize_bedrock_response(final_response)
+    final_response_data = normalize_claude_response(final_response)
     final_output_text = extract_output_text(final_response, final_response_data)
     normalized_text = normalize_required_audit_json_text(final_output_text)
     finalizer_parse_failed = normalized_text is None
@@ -929,7 +922,7 @@ def rewrite_response_output_text(response_data: dict[str, Any], output_text: str
     if not isinstance(message, dict):
         message = {"role": "assistant"}
         output["message"] = message
-    message["content"] = [{"text": output_text}]
+    message["content"] = [{"type": "text", "text": output_text}]
 
 
 def annotate_json_rewrite(
@@ -959,19 +952,24 @@ def extract_tool_uses(response_message: Any) -> list[dict[str, Any]]:
         return []
     tool_uses: list[dict[str, Any]] = []
     for block in content:
-        if isinstance(block, dict) and isinstance(block.get("toolUse"), dict):
+        if not isinstance(block, dict):
+            continue
+        if isinstance(block.get("toolUse"), dict):
             tool_uses.append(block["toolUse"])
+            continue
+        if block.get("type") == "tool_use":
+            tool_uses.append(block)
     return tool_uses
 
 
-async def call_mcp_tool_for_bedrock(
+async def call_mcp_tool_for_claude(
     *,
     session: Any,
     tool_use: dict[str, Any],
     allowed_tool_names: set[str],
     mcp_read_timeout: float,
 ) -> dict[str, Any]:
-    tool_use_id = str(tool_use.get("toolUseId") or "")
+    tool_use_id = str(tool_use.get("id") or tool_use.get("toolUseId") or "")
     tool_name = str(tool_use.get("name") or "")
     tool_input = tool_use.get("input")
     if not isinstance(tool_input, dict):
@@ -980,7 +978,7 @@ async def call_mcp_tool_for_bedrock(
     if not tool_use_id:
         return build_tool_result_block(
             tool_use_id="missing-tool-use-id",
-            payload={"error": "Bedrock did not provide a toolUseId."},
+            payload={"error": "Claude did not provide a tool use id."},
             status="error",
         )
     if tool_name not in allowed_tool_names:
@@ -1020,48 +1018,42 @@ def build_tool_result_block(
     payload: Any,
     status: str,
 ) -> dict[str, Any]:
+    content = json.dumps(payload, ensure_ascii=False)
     return {
-        "toolResult": {
-            "toolUseId": tool_use_id,
-            "content": [{"json": payload}],
-            "status": status,
-        }
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+        "is_error": status == "error",
     }
 
 
-def build_bedrock_langfuse_tool_call(
+def build_claude_langfuse_tool_call(
     *,
     tool_use: dict[str, Any],
     tool_result_block: dict[str, Any],
     round_index: int,
 ) -> dict[str, Any]:
-    tool_result = tool_result_block.get("toolResult")
-    if not isinstance(tool_result, dict):
-        tool_result = {}
     return {
-        "provider": "claude_bedrock",
+        "provider": "claude",
         "tool_type": "mcp",
         "name": tool_use.get("name"),
-        "id": tool_use.get("toolUseId"),
-        "status": tool_result.get("status"),
+        "id": tool_use.get("id") or tool_use.get("toolUseId"),
+        "status": "error" if tool_result_block.get("is_error") else "success",
         "input": tool_use.get("input"),
-        "output": extract_bedrock_tool_result_payload(tool_result),
-        "raw_type": "toolUse",
+        "output": extract_claude_tool_result_payload(tool_result_block),
+        "raw_type": "tool_use",
         "round": round_index,
     }
 
 
-def extract_bedrock_tool_result_payload(tool_result: dict[str, Any]) -> Any:
+def extract_claude_tool_result_payload(tool_result: dict[str, Any]) -> Any:
     content = tool_result.get("content")
-    if not isinstance(content, list) or not content:
-        return None
-    if len(content) == 1 and isinstance(content[0], dict):
-        block = content[0]
-        if "json" in block:
-            return block["json"]
-        if "text" in block:
-            return block["text"]
-    return content
+    if not isinstance(content, str):
+        return content
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return content
 
 
 def extract_output_text(response, response_data: dict[str, Any]) -> str:
@@ -1098,11 +1090,17 @@ def extract_langfuse_usage_details(response, response_data: dict[str, Any]) -> d
     if not isinstance(usage, dict):
         return {}
 
-    input_tokens = read_usage_int(usage, "inputTokens")
-    output_tokens = read_usage_int(usage, "outputTokens")
-    total_tokens = read_usage_int(usage, "totalTokens")
-    cache_read_tokens = read_usage_int(usage, "cacheReadInputTokens")
-    cache_write_tokens = read_usage_int(usage, "cacheWriteInputTokens")
+    input_tokens = read_first_usage_int(usage, ("input_tokens", "inputTokens"))
+    output_tokens = read_first_usage_int(usage, ("output_tokens", "outputTokens"))
+    total_tokens = read_first_usage_int(usage, ("total_tokens", "totalTokens"))
+    cache_read_tokens = read_first_usage_int(
+        usage,
+        ("cache_read_input_tokens", "cacheReadInputTokens"),
+    )
+    cache_write_tokens = read_first_usage_int(
+        usage,
+        ("cache_creation_input_tokens", "cacheWriteInputTokens"),
+    )
 
     usage_details: dict[str, int] = {}
     if input_tokens is not None:
@@ -1116,6 +1114,14 @@ def extract_langfuse_usage_details(response, response_data: dict[str, Any]) -> d
         usage_details["cached_input"] = cached_tokens
         usage_details["uncached_input"] = max(input_tokens - cached_tokens, 0) if input_tokens else 0
     return usage_details
+
+
+def read_first_usage_int(container: dict[str, Any], field_names: Sequence[str]) -> int | None:
+    for field_name in field_names:
+        value = read_usage_int(container, field_name)
+        if value is not None:
+            return value
+    return None
 
 
 def combine_langfuse_usage_details(*usage_items: dict[str, int]) -> dict[str, int]:
@@ -1150,7 +1156,7 @@ def to_dict(response) -> dict[str, Any]:
     data = safe_serialize_value(response)
     if isinstance(data, dict):
         return data
-    raise RuntimeError("Could not convert the Bedrock response object to a dictionary.")
+    raise RuntimeError("Could not convert the Claude response object to a dictionary.")
 
 
 def format_exception_message(exc: BaseException, seen: set[int] | None = None) -> str:
@@ -1212,12 +1218,7 @@ def main() -> int:
         print(f"Loaded environment from {dotenv_path}", file=sys.stderr)
     if langfuse_runtime.status_message:
         print(langfuse_runtime.status_message, file=sys.stderr)
-    print(
-        f"Using Amazon Bedrock region {client.region_name}"
-        + (f" with profile {client.profile_name}" if client.profile_name else "")
-        + ".",
-        file=sys.stderr,
-    )
+    print(f"Using Anthropic API key from {client.api_key_env}.", file=sys.stderr)
 
     trace_url: str | None = None
     upload_temp_dir: Path | None = None
@@ -1281,7 +1282,7 @@ def main() -> int:
 
                 generation_context = (
                     langfuse_runtime.client.start_as_current_observation(
-                        name="bedrock-runtime.converse",
+                        name="anthropic.messages.create",
                         as_type="generation",
                         input=build_langfuse_generation_input(
                             tex_path=tex_path,
