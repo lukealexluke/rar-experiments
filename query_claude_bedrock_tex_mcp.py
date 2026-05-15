@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Sequence
@@ -65,6 +66,17 @@ LEGACY_CLAUDE_INPUT_COST_ENV = "CLAUDE_BEDROCK_INPUT_COST_PER_1M"
 LEGACY_CLAUDE_CACHED_INPUT_COST_ENV = "CLAUDE_BEDROCK_CACHED_INPUT_COST_PER_1M"
 LEGACY_CLAUDE_OUTPUT_COST_ENV = "CLAUDE_BEDROCK_OUTPUT_COST_PER_1M"
 DEFAULT_CLAUDE_JSON_FINALIZER_MAX_OUTPUT_TOKENS = 1024
+DEFAULT_CLAUDE_API_MAX_RETRIES = 5
+DEFAULT_CLAUDE_API_RETRY_INITIAL_DELAY = 2.0
+DEFAULT_CLAUDE_API_RETRY_MAX_DELAY = 60.0
+CLAUDE_RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+CLAUDE_RETRYABLE_ERROR_TYPES = {
+    "api_connection_error",
+    "api_error",
+    "api_timeout_error",
+    "overloaded_error",
+    "rate_limit_error",
+}
 CLAUDE_JSON_SOURCE_OUTPUT_TEXT_LIMIT = 4000
 REQUIRED_AUDIT_JSON_KEYS = ("ai_id", "ai_num")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -641,12 +653,113 @@ def converse(
         request["tools"] = tool_specs
     if additional_model_request_fields:
         request.update(additional_model_request_fields)
-    try:
-        return client.messages_client.messages.create(**request)
-    except Exception as exc:
-        raise RuntimeError(
-            "Anthropic Messages API operation failed: " + format_exception_message(exc)
-        ) from exc
+    for attempt_index in range(DEFAULT_CLAUDE_API_MAX_RETRIES + 1):
+        try:
+            return client.messages_client.messages.create(**request)
+        except Exception as exc:
+            if (
+                attempt_index >= DEFAULT_CLAUDE_API_MAX_RETRIES
+                or not is_retryable_anthropic_error(exc)
+            ):
+                raise RuntimeError(
+                    "Anthropic Messages API operation failed after "
+                    f"{attempt_index + 1} attempt(s): {format_exception_message(exc)}"
+                ) from exc
+            delay = compute_anthropic_retry_delay(attempt_index)
+            print(
+                "Warning: Anthropic Messages API transient failure "
+                f"({summarize_anthropic_error(exc)}); retrying in {delay:g}s "
+                f"[attempt {attempt_index + 2}/{DEFAULT_CLAUDE_API_MAX_RETRIES + 1}].",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("Anthropic Messages API operation failed unexpectedly.")
+
+
+def is_retryable_anthropic_error(exc: BaseException) -> bool:
+    status_code = read_exception_status_code(exc)
+    if status_code in CLAUDE_RETRYABLE_STATUS_CODES:
+        return True
+
+    error_type = read_exception_error_type(exc)
+    if error_type in CLAUDE_RETRYABLE_ERROR_TYPES:
+        return True
+
+    class_name = exc.__class__.__name__.lower()
+    return any(
+        marker in class_name
+        for marker in ("overloaded", "ratelimit", "rate_limit", "timeout", "connection")
+    )
+
+
+def compute_anthropic_retry_delay(attempt_index: int) -> float:
+    delay = DEFAULT_CLAUDE_API_RETRY_INITIAL_DELAY * (2 ** attempt_index)
+    return min(delay, DEFAULT_CLAUDE_API_RETRY_MAX_DELAY)
+
+
+def summarize_anthropic_error(exc: BaseException) -> str:
+    status_code = read_exception_status_code(exc)
+    error_type = read_exception_error_type(exc)
+    parts = []
+    if status_code is not None:
+        parts.append(str(status_code))
+    if error_type:
+        parts.append(error_type)
+    if parts:
+        return " ".join(parts)
+    return exc.__class__.__name__
+
+
+def read_exception_status_code(exc: BaseException) -> int | None:
+    for field_name in ("status_code", "status"):
+        value = getattr(exc, field_name, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    return read_status_code_from_mapping(getattr(exc, "body", None))
+
+
+def read_status_code_from_mapping(value: Any) -> int | None:
+    if not isinstance(value, dict):
+        return None
+    for field_name in ("status_code", "status"):
+        raw_value = value.get(field_name)
+        if raw_value is None:
+            continue
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def read_exception_error_type(exc: BaseException) -> str:
+    error_type = read_error_type_from_mapping(getattr(exc, "body", None))
+    if error_type:
+        return error_type
+    error = getattr(exc, "error", None)
+    error_type = read_error_type_from_mapping(safe_serialize_value(error))
+    if error_type:
+        return error_type
+    return ""
+
+
+def read_error_type_from_mapping(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    nested_error = value.get("error")
+    if isinstance(nested_error, dict):
+        nested_type = nested_error.get("type")
+        if isinstance(nested_type, str) and nested_type.strip():
+            return nested_type.strip().lower()
+    direct_type = value.get("type")
+    if isinstance(direct_type, str) and direct_type.strip():
+        return direct_type.strip().lower()
+    return ""
 
 
 def normalize_anthropic_model_id(model: str) -> str:
