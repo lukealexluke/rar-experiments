@@ -35,6 +35,12 @@ DEFAULT_DOTENV_FILENAME = ".env"
 DEFAULT_BODY_CONTEXT_LINES = 20
 DEFAULT_RETRIEVAL_MODE = "mcp"
 RETRIEVAL_MODES = ("mcp", "web-search", "none")
+WEB_SEARCH_CUTOFF_INSTRUCTION = (
+    "When searching via the web, disregard any results from after Janurary 31st 2026. "
+    "Use or cite only web results whose publication or source date is on or before "
+    "January 31, 2026. If a result has no clear date, use it only when the content "
+    "itself establishes that it predates that cutoff."
+)
 DEFAULT_LANGFUSE_TRACE_NAME = "tex-bib-mcp-query"
 DEFAULT_LANGFUSE_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 DEFAULT_LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
@@ -1356,7 +1362,8 @@ def build_retrieval_instruction(retrieval_mode: str) -> str:
     if retrieval_mode == "web-search":
         return (
             "Use web search when it would improve factual or literature-grounded "
-            "answers. Do not use TheoremSearch or MCP tools in this mode."
+            "answers. Do not use TheoremSearch or MCP tools in this mode. "
+            f"{WEB_SEARCH_CUTOFF_INSTRUCTION}"
         )
     return (
         "Do not use external retrieval tools. Answer only from the attached files "
@@ -1375,7 +1382,10 @@ def build_system_prompt(retrieval_mode: str = DEFAULT_RETRIEVAL_MODE) -> str:
     if retrieval_mode == "web-search":
         return (
             "You may use the provider web search tool for external retrieval. "
-            "Do not use MCP or TheoremSearch tools in this session."
+            "Do not use MCP or TheoremSearch tools in this session. "
+            f"{WEB_SEARCH_CUTOFF_INSTRUCTION} "
+            "Before relying on a web result, verify that it satisfies this cutoff; "
+            "discard later-dated results even if they seem relevant."
         )
     return (
         "You do not have access to external retrieval tools in this session. "
